@@ -116,6 +116,34 @@ and subset), judges, thinking and both parsers; the name is not compared. Starti
 therefore runs only new experiments and resumes a stopped one, while changing settings under the same
 name reruns it (with a warning). `--rerun` repeats everything; memory changes are not a new experiment.
 
+## Models hosted outside the cluster
+
+An experiment with `ask_endpoint: <judge name>` answers the ask questions with that judge's hosted
+model instead of `cpu-small`:
+
+```yaml
+experiments:
+  - name: "External - glm-5-3"
+    ask_endpoint: glm-5-3      # judged by deepseek only
+  - name: "External - deepseek"
+    ask_endpoint: deepseek     # judged by glm-5-3 only
+```
+
+For such an experiment the runner leaves the InferenceService alone and instead patches Praxis:
+
+- Requests with `X-OLS-Mode: ask` go to the host in `HOSTED_VLLM_API_BASE` over TLS, with the model
+  name, path and `Host` header rewritten for that endpoint. Other traffic is unchanged.
+- The Praxis Deployment gets `HOSTED_VLLM_API_KEY` from the `eval-credentials` secret (the same one
+  the judges use) and injects it as `Authorization: Bearer`, replacing whatever the caller sent.
+- The endpoint's own judge is removed from the panel, so only the other judges score it. The
+  experiment needs at least one other judge.
+- After the Job (or before the next local experiment) Praxis is put back on its original config.
+  The original ConfigMap name is kept in the `hybrid-eval/original-praxis-config` annotation, so a
+  killed Job is repaired by the next run.
+
+Only `hosted_vllm` judges can be used this way. Re-run `oc apply -f eval/cluster/eval-runner.yaml` to
+grant the runner the Deployment and ConfigMap permissions this needs, and rebuild the image.
+
 ## Sizing
 
 On CPU, vLLM reserves **92% of the pod's memory limit** (`--gpu-memory-utilization`) and fills the
