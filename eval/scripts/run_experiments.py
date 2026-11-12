@@ -760,6 +760,16 @@ def slug(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9]+", "_", name).strip("_").lower()
 
 
+def isvc_generation(cfg: dict[str, Any]) -> Optional[int]:
+    """The InferenceService spec generation, or None if it does not exist yet."""
+    out = oc(
+        "get", "inferenceservice", cfg["isvc"], "-n", cfg["namespace"],
+        "-o", "jsonpath={.metadata.generation}",
+        check=False,
+    ).strip()
+    return int(out) if out else None
+
+
 def wait_until_ready(cfg: dict[str, Any], applied_at: datetime, restarted: bool) -> str:
     """Wait for a ready pod (newer than applied_at when the manifest changed)."""
     deadline = time.time() + float(cfg["ready_timeout_minutes"]) * 60
@@ -770,9 +780,12 @@ def wait_until_ready(cfg: dict[str, Any], applied_at: datetime, restarted: bool)
             "-l", f"serving.kserve.io/inferenceservice={cfg['isvc']}",
         )["items"]
         for pod in pods:
-            started = datetime.strptime(
-                pod["status"]["startTime"], "%Y-%m-%dT%H:%M:%SZ"
-            ).replace(tzinfo=timezone.utc)
+            start_time = pod["status"].get("startTime")
+            if not start_time:
+                continue
+            started = datetime.strptime(start_time, "%Y-%m-%dT%H:%M:%SZ").replace(
+                tzinfo=timezone.utc
+            )
             if restarted and started < cutoff:
                 continue
             statuses = pod["status"].get("containerStatuses", [])
@@ -1008,10 +1021,11 @@ def run_experiment(cfg: dict[str, Any], base: dict[str, Any]) -> None:
         rendered = rendered_dir / f"{slug(cfg['name'])}.yaml"
         rendered.write_text(yaml.safe_dump(render_manifest(base, cfg), sort_keys=False))
 
+        generation_before = isvc_generation(cfg)
         applied_at = datetime.now(timezone.utc)
         out = oc("apply", "-f", str(rendered))
         print(out.strip())
-        restarted = "unchanged" not in out
+        restarted = isvc_generation(cfg) != generation_before
         pod = wait_until_ready(cfg, applied_at, restarted)
         binding = check_binding(cfg, pod)
         print(f"Pod {pod} ready; vLLM threads: {binding.get('vllm_omp_threads')} "
