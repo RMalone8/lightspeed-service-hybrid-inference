@@ -16,6 +16,7 @@ defaults:
   # Where things live, inside the runner image (see eval/cluster/build/Dockerfile).
   base_manifest: examples/hybrid-inference/cpu-small/inferenceservice.yaml
   isvc: cpu-small
+  praxis_deployment: praxis       # patched only by experiments that set `ask_endpoint`
   namespace: openshift-lightspeed
   eval_repo: /opt/hybrid
   eval_cmd: lightspeed-eval
@@ -124,73 +125,24 @@ judges:
   glm-5-3:
     provider: hosted_vllm
     model: rits/zai-org/glm-5-3
-    temperature: 0.0
+    temperature: 1.0
   deepseek:
     provider: hosted_vllm
     model: rits/deepseek-ai/DeepSeek-V4.1-Flash-1017
-    temperature: 0.0
+    temperature: 1.0
   
 
+# Local experiments name a `model` and run on the cpu-small InferenceService. An experiment with
+# `ask_endpoint: <judge name>` instead runs the ask questions on that judge's hosted model, outside
+# the cluster: the runner points Praxis at the endpoint in HOSTED_VLLM_API_BASE, with the key from
+# the eval-credentials secret, and puts Praxis back afterwards. That judge is dropped from the
+# experiment's panel, so the other judges score it and it never scores itself.
 experiments:
-  - name: "AgentWorld"
-    model: agentworld
-    omp_threads_bind: "16-30"
-    thinking: true
+  - name: "External - glm-5-3"
+    ask_endpoint: glm-5-3
 
-  - name: "AgentWorld - no thinking"
-    model: agentworld
-    omp_threads_bind: "16-30"
-    thinking: false
-
-  - name: "Qwen3.5-4B"
-    model: qwen3.5-4b
-    omp_threads_bind: "16-30"
-    thinking: true
-
-  - name: "Qwen3.5-4B - no thinking"
-    model: qwen3.5-4b
-    omp_threads_bind: "16-30"
-    thinking: false
-
-  - name: "granite4.2-3b"
-    model: granite4.2-3b
-    omp_threads_bind: "16-30"
-    thinking: true
-
-  - name: "granite4.2-3b - no thinking"
-    model: granite4.2-3b
-    omp_threads_bind: "16-30"
-    thinking: false
-
-  - name: "granite4.2-8b"
-    model: granite4.2-8b
-    omp_threads_bind: "16-30"
-    thinking: true
-
-  - name: "granite4.2-8b - no thinking"
-    model: granite4.2-8b
-    omp_threads_bind: "16-30"
-    thinking: false
-
-  - name: "gpt-oss"
-    model: gpt-oss
-    omp_threads_bind: "16-30"
-    thinking: true
-
-  - name: "meta-llama - no thinking"
-    model: meta-llama
-    omp_threads_bind: "16-30"
-    thinking: false
-
-  - name: "gemma"
-    model: gemma
-    omp_threads_bind: "16-30"
-    thinking: true
-
-  - name: "gemma - no thinking"
-    model: gemma
-    omp_threads_bind: "16-30"
-    thinking: false
+  - name: "External - deepseek"
+    ask_endpoint: deepseek
 
   # Examples of other things you can vary (uncomment and edit):
   #

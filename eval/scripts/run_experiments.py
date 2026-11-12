@@ -21,6 +21,7 @@ import shlex
 import subprocess
 import sys
 import time
+import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -423,6 +424,228 @@ def resolve_judges(cfg: dict[str, Any], registry: dict[str, Any]) -> dict[str, A
     }
 
 
+def resolve_external(cfg: dict[str, Any], registry: dict[str, Any]) -> dict[str, Any]:
+    """Turn `ask_endpoint: <judge name>` into a model hosted outside the cluster.
+
+    The named judge's endpoint answers the ask questions, so it is removed from the panel:
+    a model never judges its own answers.
+    """
+    alias = cfg["ask_endpoint"]
+    if alias not in registry:
+        raise SystemExit(
+            f"Experiment {cfg['name']!r} uses ask_endpoint {alias!r}, which is not defined under "
+            f"`judges:`. Defined: {sorted(registry)}"
+        )
+    entry = registry[alias]
+    if entry["provider"] != EXTERNAL_PROVIDER:
+        raise SystemExit(
+            f"Experiment {cfg['name']!r}: ask_endpoint {alias!r} uses provider {entry['provider']!r}; "
+            f"only {EXTERNAL_PROVIDER} judges can serve ask requests"
+        )
+    names = cfg.get("judges")
+    names = [names] if isinstance(names, str) else list(names or [])
+    remaining = [n for n in names if n != alias]
+    if not remaining:
+        raise SystemExit(
+            f"Experiment {cfg['name']!r}: no judge is left once {alias!r} is removed from its panel. "
+            "List at least one other judge."
+        )
+    return {
+        **cfg,
+        "ask_entry": {"alias": alias, **entry},
+        "model_key": alias,
+        "model": entry["model"],
+        "tool_call_parser": NO_PARSER,
+        "reasoning_parser": NO_PARSER,
+        "gated": False,
+        "thinking": None,
+        "omp_threads_bind": "keep",
+        "judges": remaining,
+    }
+
+
+def external_base_url() -> Optional[str]:
+    """The external endpoint's base URL from the environment (the eval-credentials secret)."""
+    return os.environ.get(EXTERNAL_BASE_ENV) or None
+
+
+class NoAliasDumper(yaml.SafeDumper):
+    """YAML dumper that never writes anchors or aliases, which Praxis rejects."""
+
+    def ignore_aliases(self, data: Any) -> bool:
+        return True
+
+
+def praxis_external_config(
+    original: dict[str, Any], model: str, base_url: str
+) -> dict[str, Any]:
+    """Return the Praxis config with ask requests sent to an external endpoint.
+
+    Requests with X-OLS-Mode: ask get their model name, path and Host rewritten and the API key
+    (read from the environment) injected, then go over TLS to the endpoint. Other traffic is untouched.
+    """
+    parsed = urllib.parse.urlparse(base_url)
+    if parsed.scheme != "https" or not parsed.hostname:
+        raise SystemExit(f"{EXTERNAL_BASE_ENV} must be an https URL, got {base_url!r}")
+    host = parsed.hostname
+    port = parsed.port or 443
+    base_path = parsed.path.rstrip("/")
+    only_ask = [{"when": {"headers": {PRAXIS_ASK_HEADER: PRAXIS_ASK_VALUE}}}]
+
+    config = copy.deepcopy(original)
+    chain = next(c for c in config["filter_chains"] if any(f["filter"] == "router" for f in c["filters"]))
+    filters = chain["filters"]
+    router_at = next(i for i, f in enumerate(filters) if f["filter"] == "router")
+
+    for route in filters[router_at]["routes"]:
+        if (route.get("headers") or {}).get(PRAXIS_ASK_HEADER) == PRAXIS_ASK_VALUE:
+            route["cluster"] = EXTERNAL_CLUSTER
+    balancer = next(f for f in filters if f["filter"] == "load_balancer")
+    balancer["clusters"] = [c for c in balancer["clusters"] if c["name"] != EXTERNAL_CLUSTER] + [
+        {
+            "name": EXTERNAL_CLUSTER,
+            "endpoints": [f"{host}:{port}"],
+            "tls": {"sni": host},
+        }
+    ]
+
+    before_router = [
+        {
+            "filter": "openai_responses_model_rewrite",
+            "model_aliases": {"hybrid-model": model},
+            "conditions": only_ask,
+        },
+        {
+            "filter": "path_rewrite",
+            "replace": {
+                "pattern": "^/v1/chat/completions$",
+                "replacement": f"{base_path}/chat/completions",
+            },
+            "conditions": only_ask,
+        },
+    ]
+    before_balancer = [
+        {
+            "filter": "headers",
+            "request_set": [{"name": "Host", "value": host}],
+            "conditions": only_ask,
+        },
+        {
+            "filter": "credential_injection",
+            "clusters": [
+                {
+                    "name": EXTERNAL_CLUSTER,
+                    "header": "Authorization",
+                    "header_prefix": "Bearer ",
+                    "env_var": EXTERNAL_KEY_ENV,
+                    "strip_client_credential": True,
+                }
+            ],
+        },
+    ]
+    balancer_at = filters.index(balancer)
+    chain["filters"] = (
+        filters[:router_at]
+        + before_router
+        + filters[router_at:balancer_at]
+        + before_balancer
+        + filters[balancer_at:]
+    )
+    return config
+
+
+def praxis_deployment(cfg: dict[str, Any]) -> dict[str, Any]:
+    """The live Praxis Deployment."""
+    return oc_json("get", "deployment", cfg.get("praxis_deployment", "praxis"), "-n", cfg["namespace"])
+
+
+def praxis_volume_config(deployment: dict[str, Any]) -> str:
+    """Name of the ConfigMap the Praxis Deployment currently mounts as its config."""
+    volumes = deployment["spec"]["template"]["spec"]["volumes"]
+    return next(v for v in volumes if v["name"] == PRAXIS_CONFIG_VOLUME)["configMap"]["name"]
+
+
+def patch_praxis(cfg: dict[str, Any], patch: dict[str, Any]) -> None:
+    """Apply a strategic merge patch to the Praxis Deployment and wait for the rollout."""
+    deployment, namespace = cfg.get("praxis_deployment", "praxis"), cfg["namespace"]
+    oc("patch", "deployment", deployment, "-n", namespace, "--type=strategic", "-p", json.dumps(patch))
+    oc("rollout", "status", f"deployment/{deployment}", "-n", namespace, f"--timeout={ROLLOUT_TIMEOUT}")
+
+
+def route_praxis_externally(cfg: dict[str, Any], results: Path) -> None:
+    """Point Praxis at the external endpoint, with the API key taken from eval-credentials."""
+    base_url = external_base_url()
+    if not base_url:
+        raise SystemExit(f"{EXTERNAL_BASE_ENV} is not set in the environment (eval-credentials)")
+    namespace = cfg["namespace"]
+    deployment = praxis_deployment(cfg)
+    annotations = deployment["metadata"].get("annotations") or {}
+    original_name = annotations.get(ORIGINAL_CONFIG_ANNOTATION) or praxis_volume_config(deployment)
+    original_map = oc_json("get", "configmap", original_name, "-n", namespace)
+    original = yaml.safe_load(original_map["data"][PRAXIS_CONFIG_FILE])
+    rendered = praxis_external_config(original, cfg["model"], base_url)
+    text = yaml.dump(rendered, Dumper=NoAliasDumper, sort_keys=False)
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:10]
+    name = f"{original_name.rsplit('-', 1)[0]}-external-{digest}"
+
+    out = results / "rendered_configs" / f"praxis_{slug(cfg['name'])}.yaml"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(text, encoding="utf-8")
+
+    manifest = {
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {"name": name, "namespace": namespace, "labels": {EXTERNAL_CONFIG_LABEL: "true"}},
+        "data": {PRAXIS_CONFIG_FILE: text},
+    }
+    apply_manifest(manifest)
+    patch_praxis(cfg, {
+        "metadata": {"annotations": {ORIGINAL_CONFIG_ANNOTATION: original_name}},
+        "spec": {"template": {"spec": {
+            "volumes": [{"name": PRAXIS_CONFIG_VOLUME, "configMap": {"name": name}}],
+            "containers": [{
+                "name": "praxis",
+                "env": [{
+                    "name": EXTERNAL_KEY_ENV,
+                    "valueFrom": {"secretKeyRef": {"name": CREDENTIALS_SECRET, "key": EXTERNAL_KEY_ENV}},
+                }],
+            }],
+        }}},
+    })
+    print(f"Praxis routes ask requests to the external endpoint for {cfg['model']}")
+
+
+def apply_manifest(manifest: dict[str, Any]) -> None:
+    """Create or update one object from a dict."""
+    result = subprocess.run(
+        ["oc", "apply", "-f", "-"], input=yaml.safe_dump(manifest),
+        capture_output=True, text=True, check=False,
+    )
+    if result.returncode != 0:
+        raise SystemExit(f"oc apply failed:\n{result.stderr.strip()}")
+
+
+def restore_praxis(cfg: dict[str, Any]) -> None:
+    """Put Praxis back on its original config and drop the external key; no-op if not patched."""
+    deployment = praxis_deployment(cfg)
+    annotations = deployment["metadata"].get("annotations") or {}
+    original_name = annotations.get(ORIGINAL_CONFIG_ANNOTATION)
+    if not original_name:
+        return
+    patch_praxis(cfg, {
+        "metadata": {"annotations": {ORIGINAL_CONFIG_ANNOTATION: None}},
+        "spec": {"template": {"spec": {
+            "volumes": [{"name": PRAXIS_CONFIG_VOLUME, "configMap": {"name": original_name}}],
+            "containers": [{
+                "name": "praxis",
+                "env": [{"name": EXTERNAL_KEY_ENV, "$patch": "delete"}],
+            }],
+        }}},
+    })
+    oc("delete", "configmap", "-n", cfg["namespace"], "-l", f"{EXTERNAL_CONFIG_LABEL}=true", check=False)
+    print("Praxis restored to its original config")
+
+
 def judges_label(cfg: dict[str, Any]) -> str:
     """Short description of the judge panel for the plan output."""
     models = [e["model"] for e in cfg["judge_entries"]]
@@ -434,7 +657,7 @@ def check_judge_credentials(experiments: list[dict[str, Any]]) -> None:
     missing = sorted({
         (e["provider"], var)
         for cfg in experiments
-        for e in cfg["judge_entries"]
+        for e in cfg["judge_entries"] + ([cfg["ask_entry"]] if cfg.get("ask_entry") else [])
         for var in PROVIDER_ENV.get(e["provider"], [])
         if not os.environ.get(var)
     })
@@ -537,6 +760,16 @@ def slug(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9]+", "_", name).strip("_").lower()
 
 
+def isvc_generation(cfg: dict[str, Any]) -> Optional[int]:
+    """The InferenceService spec generation, or None if it does not exist yet."""
+    out = oc(
+        "get", "inferenceservice", cfg["isvc"], "-n", cfg["namespace"],
+        "-o", "jsonpath={.metadata.generation}",
+        check=False,
+    ).strip()
+    return int(out) if out else None
+
+
 def wait_until_ready(cfg: dict[str, Any], applied_at: datetime, restarted: bool) -> str:
     """Wait for a ready pod (newer than applied_at when the manifest changed)."""
     deadline = time.time() + float(cfg["ready_timeout_minutes"]) * 60
@@ -547,9 +780,12 @@ def wait_until_ready(cfg: dict[str, Any], applied_at: datetime, restarted: bool)
             "-l", f"serving.kserve.io/inferenceservice={cfg['isvc']}",
         )["items"]
         for pod in pods:
-            started = datetime.strptime(
-                pod["status"]["startTime"], "%Y-%m-%dT%H:%M:%SZ"
-            ).replace(tzinfo=timezone.utc)
+            start_time = pod["status"].get("startTime")
+            if not start_time:
+                continue
+            started = datetime.strptime(start_time, "%Y-%m-%dT%H:%M:%SZ").replace(
+                tzinfo=timezone.utc
+            )
             if restarted and started < cutoff:
                 continue
             statuses = pod["status"].get("containerStatuses", [])
@@ -597,18 +833,31 @@ def cluster_token() -> str:
 
 FINGERPRINT_KEYS = (
     "model", "cores", "max_model_len", "dataset", "extra_args", "extra_env",
-    "cpu_limit", "judges", "thinking", "tool_call_parser", "reasoning_parser",
+    "cpu_limit", "judges", "thinking", "tool_call_parser", "reasoning_parser", "ask_endpoint",
 )
 DEFAULT_DEDUPE_ON = [
     "model", "cores", "max_model_len", "dataset", "judges", "thinking",
-    "tool_call_parser", "reasoning_parser",
+    "tool_call_parser", "reasoning_parser", "ask_endpoint",
 ]
 LEGACY_DEFAULTS = {
     "thinking": False,
     "tool_call_parser": "qwen3_coder",
     "reasoning_parser": "qwen3",
+    "ask_endpoint": None,
 }
 REQUIRED_JUDGE_KEYS = ("provider", "model")
+EXTERNAL_PROVIDER = "hosted_vllm"
+EXTERNAL_KEY_ENV = "HOSTED_VLLM_API_KEY"
+EXTERNAL_BASE_ENV = "HOSTED_VLLM_API_BASE"
+CREDENTIALS_SECRET = "eval-credentials"
+PRAXIS_CONFIG_VOLUME = "config"
+PRAXIS_CONFIG_FILE = "config.yaml"
+PRAXIS_ASK_HEADER = "X-OLS-Mode"
+PRAXIS_ASK_VALUE = "ask"
+EXTERNAL_CLUSTER = "external"
+ORIGINAL_CONFIG_ANNOTATION = "hybrid-eval/original-praxis-config"
+EXTERNAL_CONFIG_LABEL = "hybrid-eval/praxis-external"
+ROLLOUT_TIMEOUT = "300s"
 EVAL_AGGREGATION = "average"
 PROVIDER_ENV = {
     "hosted_vllm": ["HOSTED_VLLM_API_KEY", "HOSTED_VLLM_API_BASE"],
@@ -698,6 +947,7 @@ def fingerprint(cfg: dict[str, Any], effective_cores: Optional[list[int]] = None
         "thinking": cfg.get("thinking"),
         "tool_call_parser": cfg.get("tool_call_parser"),
         "reasoning_parser": cfg.get("reasoning_parser"),
+        "ask_endpoint": cfg.get("ask_endpoint"),
     }
 
 
@@ -761,19 +1011,25 @@ def run_experiment(cfg: dict[str, Any], base: dict[str, Any]) -> None:
     """Apply one experiment, run the eval, and record its metadata."""
     results = expand(cfg["results_dir"])
     results.mkdir(parents=True, exist_ok=True)
-    rendered_dir = results / "rendered_manifests"
-    rendered_dir.mkdir(exist_ok=True)
-    rendered = rendered_dir / f"{slug(cfg['name'])}.yaml"
-    rendered.write_text(yaml.safe_dump(render_manifest(base, cfg), sort_keys=False))
+    external = bool(cfg.get("ask_endpoint"))
+    if external:
+        route_praxis_externally(cfg, results)
+    else:
+        restore_praxis(cfg)
+        rendered_dir = results / "rendered_manifests"
+        rendered_dir.mkdir(exist_ok=True)
+        rendered = rendered_dir / f"{slug(cfg['name'])}.yaml"
+        rendered.write_text(yaml.safe_dump(render_manifest(base, cfg), sort_keys=False))
 
-    applied_at = datetime.now(timezone.utc)
-    out = oc("apply", "-f", str(rendered))
-    print(out.strip())
-    restarted = "unchanged" not in out
-    pod = wait_until_ready(cfg, applied_at, restarted)
-    binding = check_binding(cfg, pod)
-    print(f"Pod {pod} ready; vLLM threads: {binding.get('vllm_omp_threads')} "
-          f"on {binding.get('vllm_omp_core_ids')}")
+        generation_before = isvc_generation(cfg)
+        applied_at = datetime.now(timezone.utc)
+        out = oc("apply", "-f", str(rendered))
+        print(out.strip())
+        restarted = isvc_generation(cfg) != generation_before
+        pod = wait_until_ready(cfg, applied_at, restarted)
+        binding = check_binding(cfg, pod)
+        print(f"Pod {pod} ready; vLLM threads: {binding.get('vllm_omp_threads')} "
+              f"on {binding.get('vllm_omp_core_ids')}")
 
     env = dict(os.environ)
     env["API_KEY"] = cluster_token()
@@ -792,7 +1048,15 @@ def run_experiment(cfg: dict[str, Any], base: dict[str, Any]) -> None:
                 f"{run_dir} has no results CSV: the eval produced nothing "
                 "(check the judge credentials and OLS access in the log above)"
             )
-        meta = collect(cfg["isvc"], cfg["namespace"])
+        if external:
+            meta = {
+                "backend_model": cfg["model"],
+                "hosting": "external",
+                "ask_endpoint": cfg["ask_endpoint"],
+                "collected_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            }
+        else:
+            meta = collect(cfg["isvc"], cfg["namespace"])
         meta["name"] = cfg["name"]
         meta["judges"] = [
             {k: v for k, v in judge.items() if v is not None} for judge in cfg["judge_entries"]
@@ -835,10 +1099,19 @@ def main() -> None:
     validate_models(models)
     judge_registry = spec.get("judges") or {}
     validate_judges(judge_registry)
-    experiments = [
-        resolve_judges(resolve_model({**defaults, **e, **overrides}, models), judge_registry)
-        for e in spec.get("experiments", [])
-    ]
+    experiments = []
+    for entry in spec.get("experiments", []):
+        merged = {**defaults, **entry, **overrides}
+        if merged.get("ask_endpoint"):
+            if "model" in entry:
+                raise SystemExit(
+                    f"Experiment {merged['name']!r} sets both `model` and `ask_endpoint`; "
+                    "an external experiment takes its model from the judge"
+                )
+            resolved = resolve_external(merged, judge_registry)
+        else:
+            resolved = resolve_model(merged, models)
+        experiments.append(resolve_judges(resolved, judge_registry))
     if args.only:
         experiments = [e for e in experiments if e["name"] == args.only]
     if not experiments:
@@ -850,8 +1123,16 @@ def main() -> None:
     base = yaml.safe_load(expand(experiments[0]["base_manifest"]).read_text(encoding="utf-8"))
     for cfg in experiments:
         cfg.setdefault("thinking", True)
+    local = [cfg for cfg in experiments if not cfg.get("ask_endpoint")]
     print(f"{len(experiments)} experiment(s):")
     for cfg in experiments:
+        if cfg.get("ask_endpoint"):
+            print(f"  - {cfg['name']}")
+            print(f"      external: ask requests go to the {cfg['ask_endpoint']} endpoint "
+                  f"({cfg['model']}) via Praxis, key from the {CREDENTIALS_SECRET} secret")
+            print(f"      judges={judges_label(cfg)}  (excludes {cfg['ask_endpoint']})")
+            print(f"      dataset={dataset_label(cfg)}")
+            continue
         model = render_manifest(base, cfg)["spec"]["predictor"]["model"]
         env = {e["name"]: e.get("value") for e in model.get("env", [])}
         print(f"  - {cfg['name']}")
@@ -863,12 +1144,12 @@ def main() -> None:
               f"judges={judges_label(cfg)}")
         print(f"      dataset={dataset_label(cfg)}")
     print("\nMemory check (checkpoint size from Hugging Face; suggested = max(checkpoint x 1.25 + 8, 32) GiB):")
-    print("\n".join(memory_report(experiments)))
-    thinking_lines = thinking_report(experiments)
+    print("\n".join(memory_report(local)) if local else "  no local experiments")
+    thinking_lines = thinking_report(local)
     if thinking_lines:
         print("\nThinking:")
         print("\n".join(thinking_lines))
-    gated_lines = gated_report(experiments)
+    gated_lines = gated_report(local)
     if gated_lines:
         print("\nGated models:")
         print("\n".join(gated_lines))
@@ -889,20 +1170,24 @@ def main() -> None:
         cfg for cfg in experiments if args.rerun or not find_duplicate(cfg, finished)[0]
     ]
     check_judge_credentials(pending)
-    problems = gated_problems(pending)
+    problems = gated_problems([cfg for cfg in pending if not cfg.get("ask_endpoint")])
     if problems:
         raise SystemExit("Gated model problems:\n" + "\n".join(f"  {p}" for p in problems))
-    for number, cfg in enumerate(experiments, 1):
-        print(f"\n=== [{number}/{len(experiments)}] {cfg['name']} ===")
-        twin, name_reused = find_duplicate(cfg, finished)
-        if twin and not args.rerun:
-            print(f"Skipping: same config already finished as {twin!r} (use --rerun to repeat)")
-            continue
-        if name_reused:
-            print("Warning: a finished run has this name but a different config. "
-                  "Consider renaming this experiment so the dashboard stays clear.")
-        run_experiment(cfg, base)
-        finished = completed_runs(expand(cfg["results_dir"]))
+    try:
+        for number, cfg in enumerate(experiments, 1):
+            print(f"\n=== [{number}/{len(experiments)}] {cfg['name']} ===")
+            twin, name_reused = find_duplicate(cfg, finished)
+            if twin and not args.rerun:
+                print(f"Skipping: same config already finished as {twin!r} (use --rerun to repeat)")
+                continue
+            if name_reused:
+                print("Warning: a finished run has this name but a different config. "
+                      "Consider renaming this experiment so the dashboard stays clear.")
+            run_experiment(cfg, base)
+            finished = completed_runs(expand(cfg["results_dir"]))
+    finally:
+        if any(cfg.get("ask_endpoint") for cfg in pending):
+            restore_praxis(experiments[0])
 
 
 if __name__ == "__main__":
