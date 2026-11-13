@@ -101,6 +101,7 @@ You MUST read the relevant file before working in a specific area — don't skip
 - Adding or modifying config models → `docs/ai/config.md`
 - Writing or debugging tests → `docs/ai/testing.md`
 - Adding or bumping Python dependencies → `docs/ai/dependencies.md`
+- Hybrid CPU/GPU inference (Praxis routing, handoff, cluster ops, evals) → `examples/hybrid-inference/AGENTS.md`
 
 ## Common Patterns
 
