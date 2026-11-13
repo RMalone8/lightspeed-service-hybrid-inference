@@ -27,6 +27,8 @@ spec:
         - --enable-auto-tool-choice
         - --tool-call-parser=qwen3_coder
         - --reasoning-parser=nemotron_v3
+        - --enable-prompt-tokens-details
+        - --enable-force-include-usage
       env:
         - name: HF_TOKEN
           valueFrom:

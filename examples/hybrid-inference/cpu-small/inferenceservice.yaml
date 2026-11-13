@@ -29,6 +29,8 @@ spec:
         - --reasoning-parser=qwen3
         - --language-model-only
         - '--default-chat-template-kwargs={"enable_thinking": false}'
+        - --enable-prompt-tokens-details
+        - --enable-force-include-usage
       env:
         - name: VLLM_CPU_OMP_THREADS_BIND
           value: "16-30"
