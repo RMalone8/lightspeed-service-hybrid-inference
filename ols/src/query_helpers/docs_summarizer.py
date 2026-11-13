@@ -162,6 +162,7 @@ class DocsSummarizer(QueryHelper):
             token_budget_tracker=self._tracker,
             audit_ctx=self._audit_ctx,
             tool_result_classifier=tool_result_classifier,
+            handoff_threshold_path=self.provider_config.handoff_threshold_path,
         )
 
     async def _resolve_tools_for_request(

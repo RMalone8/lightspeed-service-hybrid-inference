@@ -229,6 +229,7 @@ class LLMExecutionAgent:
         audit_ctx: Optional[AuditContext] = None,
         tool_result_classifier: ToolResultClassifier | None = None,
         tool_call_round_timeout: int | None = None,
+        handoff_threshold_path: str | None = None,
     ) -> None:
         """Initialize the tool calling agent.
 
@@ -244,6 +245,9 @@ class LLMExecutionAgent:
             tool_result_classifier: Optional classifier for model-visible tool results.
             tool_call_round_timeout: Optional per-round timeout in seconds. Falls
                 back to ``constants.TOOL_CALL_ROUND_TIMEOUT`` when unset.
+            handoff_threshold_path: Optional file holding the fraction of the tool
+                budget at which calls are tagged for handoff; the default applies
+                when the file is missing or invalid.
         """
         self.bare_llm = bare_llm
         self.model = model
@@ -255,6 +259,7 @@ class LLMExecutionAgent:
         self._audit_ctx = audit_ctx
         self._tool_result_classifier = tool_result_classifier
         self._tool_call_round_timeout = tool_call_round_timeout
+        self._handoff_threshold_path = handoff_threshold_path
 
     async def execute(
         self,
@@ -417,13 +422,33 @@ class LLMExecutionAgent:
         round_tools = [] if synthesize else all_mcp_tools
         return round_messages, round_tools, synthesize
 
+    def _handoff_fraction(self) -> float:
+        """Return the tool budget fraction that triggers handoff, as configured on disk."""
+        default = constants.HANDOFF_TOOL_BUDGET_FRACTION
+        if self._handoff_threshold_path is None:
+            return default
+        try:
+            with open(self._handoff_threshold_path, encoding="utf-8") as f:
+                fraction = float(f.read().strip())
+        except FileNotFoundError:
+            return default
+        except (OSError, ValueError):
+            logger.warning(
+                "Ignoring unreadable handoff threshold in %s",
+                self._handoff_threshold_path,
+            )
+            return default
+        if not 0 <= fraction <= 1:
+            logger.warning("Ignoring out-of-range handoff threshold %s", fraction)
+            return default
+        return fraction
+
     def _tool_budget_handoff(self) -> bool:
         """Return True once enough of the tool token budget is used to hand off."""
         budget = self._tracker.max_tool_tokens
         return (
             budget > 0
-            and self._tracker.tool_budget_used / budget
-            >= constants.HANDOFF_TOOL_BUDGET_FRACTION
+            and self._tracker.tool_budget_used / budget >= self._handoff_fraction()
         )
 
     async def _iterate_with_tools(  # noqa: C901

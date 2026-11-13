@@ -22,12 +22,26 @@ and OLS marks later calls with `X-OLS-Handoff: true`. The first Praxis route mat
 `X-OLS-Mode: ask` and sends the call to `gpu-large`. OLS sends it on:
 
 - the forced last round after tool calling, which writes the answer;
-- every call once the tool calls and their results have used half of the tool token budget
-  (`HANDOFF_TOOL_BUDGET_FRACTION` in `ols/constants.py`; the budget is the context window times
-  `tool_budget_ratio`), since the prompt each round resends keeps growing with tool output.
+- every call once the tool calls and their results have used a set fraction of the tool token budget
+  (the context window times `tool_budget_ratio`), since the prompt each round resends keeps growing
+  with tool output. The fraction defaults to 0.5 (`HANDOFF_TOOL_BUDGET_FRACTION` in `ols/constants.py`).
 
 With tool calling off nothing is sent and `ask` stays on `cpu-small`. A model that stops calling tools
 before either point also answers on `cpu-small`.
+
+#### Changing the threshold
+
+The operator cannot pass new settings to OLS, so the fraction is read from a file in the provider's
+credentials directory: add a `handoff_tool_budget` key (a number from 0 to 1) to the credentials Secret.
+A missing or invalid value falls back to the default, with a warning in the OLS log for an invalid one.
+
+```bash
+oc patch secret llmcreds-praxis -n openshift-lightspeed --type=merge \
+  -p '{"stringData":{"handoff_tool_budget":"0.4"}}'
+```
+
+The operator rolls the app server whenever that Secret changes, so a new value takes effect in about a
+minute, with no image rebuild. Use `1` to hand off only on the last round, or `0` to hand off every call.
 
 ## Prerequisites
 

@@ -2374,3 +2374,67 @@ def test_tool_budget_handoff_with_no_tool_budget() -> None:
     agent = _make_agent()
     agent._tracker.max_tool_tokens = 0
     assert agent._tool_budget_handoff() is False
+
+
+def _threshold_agent(tmp_path: Any, content: str | None) -> LLMExecutionAgent:
+    """Create an agent whose handoff threshold file holds ``content`` (None: missing)."""
+    path = tmp_path / constants.HANDOFF_THRESHOLD_FILENAME
+    if content is not None:
+        path.write_text(content)
+    agent = _make_agent(handoff_threshold_path=str(path))
+    agent._tracker.max_tool_tokens = 8192
+    return agent
+
+
+def test_handoff_fraction_defaults_without_a_threshold_path() -> None:
+    """No threshold path means the built-in default."""
+    assert _make_agent()._handoff_fraction() == constants.HANDOFF_TOOL_BUDGET_FRACTION
+
+
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    [
+        (None, constants.HANDOFF_TOOL_BUDGET_FRACTION),
+        ("0.3\n", 0.3),
+        ("  0.75  ", 0.75),
+        ("0", 0.0),
+        ("1", 1.0),
+        ("not-a-number", constants.HANDOFF_TOOL_BUDGET_FRACTION),
+        ("", constants.HANDOFF_TOOL_BUDGET_FRACTION),
+        ("1.5", constants.HANDOFF_TOOL_BUDGET_FRACTION),
+        ("-0.1", constants.HANDOFF_TOOL_BUDGET_FRACTION),
+    ],
+)
+def test_handoff_fraction_reads_the_threshold_file(
+    tmp_path: Any, content: str | None, expected: float
+) -> None:
+    """A valid file overrides the default; missing or invalid files fall back to it."""
+    assert _threshold_agent(tmp_path, content)._handoff_fraction() == expected
+
+
+def test_handoff_fraction_follows_changes_to_the_file(tmp_path: Any) -> None:
+    """A rewritten file is picked up without recreating the agent."""
+    agent = _threshold_agent(tmp_path, "0.2")
+    assert agent._handoff_fraction() == 0.2
+    (tmp_path / constants.HANDOFF_THRESHOLD_FILENAME).write_text("0.8")
+    assert agent._handoff_fraction() == 0.8
+
+
+def test_invalid_handoff_threshold_is_logged(tmp_path: Any, caplog: Any) -> None:
+    """An unreadable threshold is reported, not silently ignored."""
+    with caplog.at_level(logging.WARNING):
+        _threshold_agent(tmp_path, "oops")._handoff_fraction()
+    assert "Ignoring unreadable handoff threshold" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    [(None, True), ("0.3", True), ("0.9", False)],
+)
+def test_tool_budget_handoff_uses_the_configured_fraction(
+    tmp_path: Any, content: str | None, expected: bool
+) -> None:
+    """With 4413 of 8192 tool tokens used (54%), the file decides whether to hand off."""
+    agent = _threshold_agent(tmp_path, content)
+    agent._tracker.charge(TokenCategory.TOOL_RESULT, 4413)
+    assert agent._tool_budget_handoff() is expected

@@ -4481,3 +4481,37 @@ def test_provider_config_get_credentials_with_directory(tmp_path: Path) -> None:
 
     secret_file.write_text("new-dir-key")
     assert provider_config.get_credentials() == "new-dir-key"
+
+
+def test_provider_handoff_threshold_path_in_credentials_directory(
+    tmp_path: Path,
+) -> None:
+    """The handoff threshold file sits next to the apitoken in a credentials directory."""
+    (tmp_path / constants.API_TOKEN_FILENAME).write_text("token")
+    provider = ProviderConfig(
+        {
+            "name": "p1",
+            "type": "openai",
+            "url": "http://url1",
+            "credentials_path": str(tmp_path),
+            "models": [{"name": "m1"}],
+        }
+    )
+    assert provider.handoff_threshold_path == str(
+        tmp_path / constants.HANDOFF_THRESHOLD_FILENAME
+    )
+
+
+def test_provider_handoff_threshold_path_without_credentials_directory() -> None:
+    """A single credentials file, or none, has no handoff threshold path."""
+    assert ProviderConfig().handoff_threshold_path is None
+    provider = ProviderConfig(
+        {
+            "name": "p1",
+            "type": "openai",
+            "url": "http://url1",
+            "credentials_path": "tests/config/secret/apitoken",
+            "models": [{"name": "m1"}],
+        }
+    )
+    assert provider.handoff_threshold_path is None

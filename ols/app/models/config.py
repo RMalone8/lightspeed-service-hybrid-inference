@@ -628,6 +628,15 @@ class ProviderConfig(BaseModel):
                 "provider URL is invalid, only http:// and https:// URLs are supported"
             )
 
+    @property
+    def handoff_threshold_path(self) -> Optional[str]:
+        """Return the optional handoff threshold file in the credentials directory."""
+        if self._credentials_path is None or not os.path.isdir(self._credentials_path):
+            return None
+        return os.path.join(
+            self._credentials_path, constants.HANDOFF_THRESHOLD_FILENAME
+        )
+
     def get_credentials(self) -> Optional[str]:
         """Return current credentials, re-reading from disk when hot-reload is enabled."""
         if self._credential_hot_reload and self._credentials_path is not None:
