@@ -417,6 +417,15 @@ class LLMExecutionAgent:
         round_tools = [] if synthesize else all_mcp_tools
         return round_messages, round_tools, synthesize
 
+    def _tool_budget_handoff(self) -> bool:
+        """Return True once enough of the tool token budget is used to hand off."""
+        budget = self._tracker.max_tool_tokens
+        return (
+            budget > 0
+            and self._tracker.tool_budget_used / budget
+            >= constants.HANDOFF_TOOL_BUDGET_FRACTION
+        )
+
     async def _iterate_with_tools(  # noqa: C901
         self,
         messages: ChatPromptTemplate,
@@ -487,6 +496,7 @@ class LLMExecutionAgent:
                     round_index=i,
                     result=round_result,
                     synthesize=synthesize,
+                    handoff=synthesize or self._tool_budget_handoff(),
                 ):
                     yield chunk
 
@@ -570,6 +580,7 @@ class LLMExecutionAgent:
         tools_map: list[StructuredTool],
         is_final_round: bool,
         token_counter: GenericTokenCounter,
+        handoff: bool = False,
     ) -> AsyncGenerator[AIMessageChunk, None]:
         """Invoke the LLM with optional tools.
 
@@ -579,6 +590,8 @@ class LLMExecutionAgent:
             tools_map: Map of available tools
             is_final_round: Flag indicating if this is the final round of tool calling
             token_counter: Counter for tracking token usage
+            handoff: Whether to tag this call with the handoff header so a routing
+                gateway can send it to a different backend
 
         Yields:
             AIMessageChunk objects from the LLM response stream
@@ -607,6 +620,11 @@ class LLMExecutionAgent:
             )  # type: ignore [assignment]
         else:
             llm = self.bare_llm.bind_tools(tools_map, **strict_kwargs)  # type: ignore [assignment]
+
+        if handoff and self.provider_type == constants.PROVIDER_RHOAI_VLLM:
+            llm = llm.bind(  # type: ignore [assignment]
+                extra_headers={constants.HANDOFF_HEADER: constants.HANDOFF_HEADER_VALUE}
+            )
 
         # create and execute the chain
         chain = messages | llm
@@ -817,6 +835,7 @@ class LLMExecutionAgent:
         round_index: int,
         result: RoundLLMResult,
         synthesize: bool,
+        handoff: bool = False,
     ) -> AsyncGenerator[StreamedChunk, None]:
         """Collect a response and retry a failed final synthesis once."""
         has_answer = False
@@ -839,6 +858,7 @@ class LLMExecutionAgent:
                     round_index=round_index,
                     result=result,
                     apply_final_answer_guard=apply_final_answer_guard,
+                    handoff=handoff,
                 ):
                     if chunk.type == StreamChunkType.TEXT and chunk.text.strip():
                         has_answer = True
@@ -876,6 +896,7 @@ class LLMExecutionAgent:
         result: RoundLLMResult,
         *,
         apply_final_answer_guard: bool = False,
+        handoff: bool = False,
     ) -> AsyncGenerator[StreamedChunk, None]:
         """Collect one round of LLM chunks, yielding streamed output.
 
@@ -895,6 +916,7 @@ class LLMExecutionAgent:
                     tools_map=all_mcp_tools,
                     is_final_round=is_final_round,
                     token_counter=token_counter,
+                    handoff=handoff,
                 ):
                     # TODO: Temporary fix for fake-llm (load test) which gives
                     # output as string. Currently every method that we use gives us

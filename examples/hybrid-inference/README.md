@@ -15,6 +15,20 @@ Praxis answers `GET /healthz` and `GET /v1/models` itself, and OLS uses one plac
 (`llmcreds-praxis`). The `praxis-config` ConfigMap carries a content-hash suffix, so `oc apply -k`
 after editing `praxis/config.yaml` rolls the Deployment.
 
+### Handoff to the GPU
+
+An `ask` query can make several calls, one per tool-calling round. `cpu-small` serves the early rounds,
+and OLS marks later calls with `X-OLS-Handoff: true`. The first Praxis route matches it together with
+`X-OLS-Mode: ask` and sends the call to `gpu-large`. OLS sends it on:
+
+- the forced last round after tool calling, which writes the answer;
+- every call once the tool calls and their results have used half of the tool token budget
+  (`HANDOFF_TOOL_BUDGET_FRACTION` in `ols/constants.py`; the budget is the context window times
+  `tool_budget_ratio`), since the prompt each round resends keeps growing with tool output.
+
+With tool calling off nothing is sent and `ask` stays on `cpu-small`. A model that stops calling tools
+before either point also answers on `cpu-small`.
+
 ## Prerequisites
 
 Lightspeed operator and RHOAI/KServe installed, a node labeled `inference=cpu-small`, and one labeled

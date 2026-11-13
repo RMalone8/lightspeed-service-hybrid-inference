@@ -53,6 +53,10 @@ class QueryMode(StrEnum):
 
 
 QUERY_MODE_HEADER = "X-OLS-Mode"
+HANDOFF_HEADER = "X-OLS-Handoff"
+HANDOFF_HEADER_VALUE = "true"
+# Fraction of the tool token budget used at which later calls are tagged with HANDOFF_HEADER.
+HANDOFF_TOOL_BUDGET_FRACTION = 0.5
 
 
 class GenericLLMParameters:

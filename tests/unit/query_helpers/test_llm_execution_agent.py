@@ -2243,3 +2243,134 @@ async def test_invoke_llm_observes_duration_histogram():
     after = [s for s in labeled._samples() if s.name.endswith("_count")]
     count_after = after[0].value if after else 0.0
     assert count_after - count_before == 1
+
+
+class _RecordingLLM:
+    """Fake LLM that records ``bind`` kwargs and streams one chunk."""
+
+    def __init__(self) -> None:
+        """Initialize with no recorded binds."""
+        self.bind_kwargs: list[dict[str, Any]] = []
+
+    def bind(self, **kwargs: Any) -> "_RecordingLLM":
+        """Record kwargs and return self."""
+        self.bind_kwargs.append(kwargs)
+        return self
+
+    def __ror__(self, other: object) -> Any:
+        """Return a chain that streams a single chunk."""
+
+        class _Chain:
+            async def astream(self, *args: Any, **kwargs: Any) -> Any:
+                yield AIMessageChunk(content="answer")
+
+        return _Chain()
+
+
+async def _invoke(agent: LLMExecutionAgent, handoff: bool) -> None:
+    """Drain ``_invoke_llm`` for a handoff or ordinary call."""
+    async for _ in agent._invoke_llm([], {}, [], True, MagicMock(), handoff=handoff):
+        pass
+
+
+@pytest.mark.asyncio
+async def test_invoke_llm_tags_handoff_on_rhoai_vllm() -> None:
+    """A handoff call carries the handoff header on rhoai_vllm."""
+    llm = _RecordingLLM()
+    agent = _make_agent(bare_llm=llm, provider_type=constants.PROVIDER_RHOAI_VLLM)
+    await _invoke(agent, handoff=True)
+    assert llm.bind_kwargs == [
+        {"extra_headers": {constants.HANDOFF_HEADER: constants.HANDOFF_HEADER_VALUE}}
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("provider_type", "handoff"),
+    [
+        (constants.PROVIDER_RHOAI_VLLM, False),
+        (constants.PROVIDER_OPENAI, True),
+    ],
+)
+async def test_invoke_llm_omits_handoff_header(
+    provider_type: str, handoff: bool
+) -> None:
+    """Ordinary calls and non-rhoai_vllm providers carry no handoff header."""
+    llm = _RecordingLLM()
+    agent = _make_agent(bare_llm=llm, provider_type=provider_type)
+    await _invoke(agent, handoff=handoff)
+    assert llm.bind_kwargs == []
+
+
+async def _handoff_flags(
+    tools: list[Any], max_rounds: int, tool_tokens_after_first_round: int = 0
+) -> list[bool]:
+    """Run the loop with scripted rounds; return the handoff flag per LLM call."""
+    agent = _make_agent(provider_type=constants.PROVIDER_RHOAI_VLLM)
+    flags: list[bool] = []
+
+    async def _fake_invoke(*args: Any, **kwargs: Any) -> Any:
+        flags.append(kwargs["handoff"])
+        if len(flags) == 1:
+            agent._tracker.charge(
+                TokenCategory.TOOL_RESULT, tool_tokens_after_first_round
+            )
+        if len(flags) < max_rounds and tools:
+            yield AIMessageChunk(
+                content="",
+                response_metadata={"finish_reason": "tool_calls"},
+                tool_call_chunks=[
+                    {"name": "get_namespaces_mock", "args": "{}", "id": "c1"}
+                ],
+                tool_calls=[{"name": "get_namespaces_mock", "args": {}, "id": "c1"}],
+            )
+        else:
+            yield AIMessageChunk(content="answer", response_metadata={})
+
+    async def _no_tools(**kwargs: Any) -> Any:
+        if False:
+            yield
+
+    with (
+        patch.object(agent, "_invoke_llm", side_effect=_fake_invoke),
+        patch.object(agent, "_process_tool_calls_for_round", new=_no_tools),
+    ):
+        async for _ in agent._iterate_with_tools(
+            messages=[],
+            max_rounds=max_rounds,
+            llm_input_values={},
+            token_counter=AsyncMock(),
+            all_mcp_tools=tools,
+        ):
+            pass
+    return flags
+
+
+@pytest.mark.asyncio
+async def test_only_final_round_hands_off_when_tool_budget_is_low() -> None:
+    """Below the budget fraction only the forced final round is handed off."""
+    flags = await _handoff_flags(mock_tools_map, max_rounds=3)
+    assert flags == [False, False, True]
+
+
+@pytest.mark.asyncio
+async def test_handoff_starts_once_tool_budget_fraction_is_used() -> None:
+    """Crossing the tool budget fraction hands off every later round."""
+    used = int(50000 * constants.HANDOFF_TOOL_BUDGET_FRACTION)
+    flags = await _handoff_flags(
+        mock_tools_map, max_rounds=4, tool_tokens_after_first_round=used
+    )
+    assert flags == [False, True, True, True]
+
+
+@pytest.mark.asyncio
+async def test_no_handoff_without_tools() -> None:
+    """With no tools bound nothing is marked, so the call stays on the primary."""
+    assert await _handoff_flags([], max_rounds=3) == [False]
+
+
+def test_tool_budget_handoff_with_no_tool_budget() -> None:
+    """An agent with no tool budget never hands off on budget."""
+    agent = _make_agent()
+    agent._tracker.max_tool_tokens = 0
+    assert agent._tool_budget_handoff() is False

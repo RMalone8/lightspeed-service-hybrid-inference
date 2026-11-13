@@ -32,6 +32,11 @@ filter_chains:
           - path_prefix: "/"
             headers:
               X-OLS-Mode: "ask"
+              X-OLS-Handoff: "true"
+            cluster: gpu-large
+          - path_prefix: "/"
+            headers:
+              X-OLS-Mode: "ask"
             cluster: cpu-small
           - path_prefix: "/"
             cluster: gpu-large
