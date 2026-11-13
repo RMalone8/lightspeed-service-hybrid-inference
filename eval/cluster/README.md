@@ -165,7 +165,9 @@ experiments:
 ```
 
 - **`handoff_endpoint` external:** nothing is patched; Praxis sends the GPU side (handoff calls and
-  non-ask traffic) to the endpoint, as for an external `model`.
+  non-ask traffic) to the endpoint, as for an external `model`. Without a `handoff_threshold` this sets
+  the GPU side only and handoff stays off, so a baseline can run on the same GPU side. Use it when the
+  cluster has no GPU node: OLS's startup check goes to the GPU side too.
 - **`handoff_endpoint` local:** the `gpu-large` InferenceService is patched to serve that model (GPU
   nodes only, not gated models) and the runner waits for it.
 - **`handoff_threshold`:** written to the `handoff_tool_budget` key of the `llmcreds-praxis` secret. The

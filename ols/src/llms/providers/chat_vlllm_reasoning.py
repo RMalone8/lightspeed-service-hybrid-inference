@@ -4,10 +4,11 @@ from typing import Any, Dict, Optional, Union
 
 from langchain_core.messages import AIMessage, AIMessageChunk
 from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
-from langchain_openai import ChatOpenAI
+
+from ols.src.llms.providers.raw_usage import ChatOpenAIRawUsage
 
 
-class ChatVLLMReasoning(ChatOpenAI):
+class ChatVLLMReasoning(ChatOpenAIRawUsage):
     """ChatOpenAI subclass that preserves vLLM/DeepSeek reasoning fields.
 
     Preserves vLLM/DeepSeek reasoning fields (``reasoning_content`` or

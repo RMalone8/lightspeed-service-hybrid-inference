@@ -92,6 +92,7 @@ storage:
       - "tokens_per_second"
       - "judge_scores"
       - "tool_calls"
+      - "round_usage"
       - "contexts"
     summary_config_sections:
       - core

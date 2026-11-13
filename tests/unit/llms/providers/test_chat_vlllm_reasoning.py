@@ -13,7 +13,7 @@ from ols.src.llms.providers.chat_vlllm_reasoning import ChatVLLMReasoning
 def chat_vllm_reasoning():
     """Create a ChatVLLMReasoning instance."""
     with patch(
-        "ols.src.llms.providers.chat_vlllm_reasoning.ChatOpenAI.__init__",
+        "langchain_openai.ChatOpenAI.__init__",
         return_value=None,
     ):
         instance = ChatVLLMReasoning()

@@ -438,7 +438,8 @@ def resolve_judges(cfg: dict[str, Any], registry: dict[str, Any]) -> dict[str, A
 def resolve_handoff(cfg: dict[str, Any], models: dict[str, Any]) -> dict[str, Any]:
     """Resolve `handoff_endpoint` (a model key) and `handoff_threshold` (0 to 1) for an experiment.
 
-    A threshold alone hands off to whatever gpu-large serves now. An endpoint needs a threshold.
+    A threshold alone hands off to whatever gpu-large serves now. An endpoint alone sets up the GPU
+    side but leaves handoff off, so a baseline can run on the same GPU side as the handoff experiments.
     No threshold means handoff is off.
     """
     endpoint, threshold = cfg.get("handoff_endpoint"), cfg.get("handoff_threshold")
@@ -450,8 +451,6 @@ def resolve_handoff(cfg: dict[str, Any], models: dict[str, Any]) -> dict[str, An
         threshold = float(threshold)
     if endpoint is None:
         return {**cfg, "handoff_entry": None, "handoff_threshold": threshold}
-    if threshold is None:
-        raise SystemExit(f"Experiment {cfg['name']!r} sets handoff_endpoint without handoff_threshold")
     if endpoint not in models:
         raise SystemExit(
             f"Experiment {cfg['name']!r} uses handoff_endpoint {endpoint!r}, which is not defined under "
@@ -830,11 +829,11 @@ def restore_handoff(cfg: dict[str, Any]) -> None:
 def handoff_label(cfg: dict[str, Any]) -> str:
     """Short description of an experiment's handoff setting for the plan output."""
     threshold, entry = cfg.get("handoff_threshold"), cfg.get("handoff_entry")
-    if threshold is None:
-        return "off"
     where = "gpu-large as deployed"
     if entry:
         where = f"external {entry['model']}" if entry["external"] else f"gpu-large serving {entry['model']}"
+    if threshold is None:
+        return f"off (GPU side: {where})" if entry else "off"
     return f"at {threshold:g} of the tool budget -> {where}"
 
 
@@ -1461,10 +1460,10 @@ def main() -> None:
             run_experiment(cfg, base)
             finished = completed_runs(expand(cfg["results_dir"]))
     finally:
-        if any(cfg.get("ask_endpoint") or (cfg.get("handoff_entry") or {}).get("external") for cfg in pending):
-            restore_praxis(experiments[0])
         if pending:
             restore_handoff(experiments[0])
+        if any(cfg.get("ask_endpoint") or (cfg.get("handoff_entry") or {}).get("external") for cfg in pending):
+            restore_praxis(experiments[0])
 
 
 if __name__ == "__main__":

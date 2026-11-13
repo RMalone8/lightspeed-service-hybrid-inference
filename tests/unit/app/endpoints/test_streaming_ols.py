@@ -392,3 +392,27 @@ async def test_response_processing_wrapper_finalization_error_yields_error_event
     assert error_event is not None
     assert "internal error" in error_event["data"]["response"].lower()
     assert "LLM" not in error_event["data"]["response"]
+
+
+def test_stream_end_event_includes_round_usage_when_given():
+    """The end event carries the per-round usage only when OLS has it."""
+    round_usage = [{"round": 1, "handoff": False, "prompt_tokens": 10}]
+    base_data = {
+        "referenced_documents": [],
+        "truncated": False,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "reasoning_tokens": 0,
+    }
+    assert stream_end_event(
+        [], False, constants.MEDIA_TYPE_JSON, None, {}, round_usage
+    ) == format_stream_data(
+        {
+            "event": "end",
+            "data": {**base_data, "round_usage": round_usage},
+            "available_quotas": {},
+        }
+    )
+    assert stream_end_event(
+        [], False, constants.MEDIA_TYPE_JSON, None, {}
+    ) == format_stream_data({"event": "end", "data": base_data, "available_quotas": {}})

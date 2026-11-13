@@ -2497,3 +2497,143 @@ def test_handoff_with_no_tool_budget(tmp_path: Any) -> None:
     agent._tracker.max_tool_tokens = 0
     assert agent._handoff(False) is False
     assert agent._handoff(True) is True
+
+
+def _usage_chunk(model: str, usage: dict[str, Any]) -> AIMessageChunk:
+    """Build the final chunk of a round: no text, only the provider's usage block."""
+    return AIMessageChunk(
+        content="", response_metadata={"raw_usage": usage, "model_name": model}
+    )
+
+
+def _tool_round_chunk() -> AIMessageChunk:
+    return AIMessageChunk(
+        content="",
+        response_metadata={"finish_reason": "tool_calls"},
+        tool_call_chunks=[{"name": "get_namespaces_mock", "args": "{}", "id": "c1"}],
+        tool_calls=[{"name": "get_namespaces_mock", "args": {}, "id": "c1"}],
+    )
+
+
+@pytest.mark.asyncio
+async def test_execute_reports_provider_usage_for_each_round(tmp_path: Any) -> None:
+    """The end chunk lists each round's reported usage, its side, and its model."""
+    agent = _handoff_agent(tmp_path, "0.5")
+    messages, inputs = GeneratePrompt("question").generate_prompt(agent.model)
+    rounds = [
+        [
+            _tool_round_chunk(),
+            _usage_chunk(
+                "hybrid-model", {"prompt_tokens": 1000, "completion_tokens": 40}
+            ),
+        ],
+        [
+            _tool_round_chunk(),
+            _usage_chunk(
+                "hybrid-model",
+                {
+                    "prompt_tokens": 1500,
+                    "completion_tokens": 30,
+                    "prompt_tokens_details": {"cached_tokens": 1000},
+                },
+            ),
+        ],
+        [
+            AIMessageChunk(content="answer", response_metadata={}),
+            AIMessageChunk(content="", response_metadata={"finish_reason": "stop"}),
+            _usage_chunk(
+                "external-model",
+                {
+                    "prompt_tokens": 2000,
+                    "completion_tokens": 90,
+                    "completion_tokens_details": {"reasoning_tokens": 60},
+                    "prompt_tokens_details": {
+                        "cached_tokens": 1500,
+                        "created_cache_tokens": 300,
+                    },
+                },
+            ),
+        ],
+    ]
+    calls: list[int] = []
+
+    async def _fake_invoke(*args: Any, **kwargs: Any) -> Any:
+        calls.append(0)
+        for chunk in rounds[len(calls) - 1]:
+            yield chunk
+
+    async def _no_tools(**kwargs: Any) -> Any:
+        if False:
+            yield
+
+    with (
+        patch.object(agent, "_invoke_llm", side_effect=_fake_invoke),
+        patch.object(agent, "_process_tool_calls_for_round", new=_no_tools),
+    ):
+        chunks = [
+            c
+            async for c in agent.execute(messages, inputs, 3, mock_tools_map, [], False)
+        ]
+
+    end = chunks[-1]
+    assert end.type == StreamChunkType.END
+    zero = {"cached_tokens": 0, "cache_write_tokens": 0, "reasoning_tokens": 0}
+    assert end.data["round_usage"] == [
+        {
+            "round": 1,
+            "handoff": False,
+            "model": "hybrid-model",
+            "usage_reported": True,
+            "prompt_tokens": 1000,
+            "completion_tokens": 40,
+            **zero,
+        },
+        {
+            "round": 2,
+            "handoff": False,
+            "model": "hybrid-model",
+            "usage_reported": True,
+            "prompt_tokens": 1500,
+            "completion_tokens": 30,
+            **{**zero, "cached_tokens": 1000},
+        },
+        {
+            "round": 3,
+            "handoff": True,
+            "model": "external-model",
+            "usage_reported": True,
+            "prompt_tokens": 2000,
+            "completion_tokens": 90,
+            "cached_tokens": 1500,
+            "cache_write_tokens": 300,
+            "reasoning_tokens": 60,
+        },
+    ]
+
+
+@pytest.mark.asyncio
+async def test_execute_marks_rounds_whose_provider_reported_no_usage() -> None:
+    """With no usage chunk the round is recorded as unreported, with no token numbers."""
+    agent = _make_agent(provider_type=constants.PROVIDER_RHOAI_VLLM)
+    messages, inputs = GeneratePrompt("question").generate_prompt(agent.model)
+
+    async def _fake_invoke(*args: Any, **kwargs: Any) -> Any:
+        yield AIMessageChunk(content="answer", response_metadata={})
+        yield AIMessageChunk(content="", response_metadata={"finish_reason": "stop"})
+
+    with patch.object(agent, "_invoke_llm", side_effect=_fake_invoke):
+        chunks = [c async for c in agent.execute(messages, inputs, 1, [], [], False)]
+
+    assert chunks[-1].data["round_usage"] == [
+        {
+            "round": 1,
+            "handoff": False,
+            "model": None,
+            "usage_reported": False,
+            "prompt_tokens": None,
+            "completion_tokens": None,
+            "cached_tokens": None,
+            "cache_write_tokens": None,
+            "reasoning_tokens": None,
+        }
+    ]

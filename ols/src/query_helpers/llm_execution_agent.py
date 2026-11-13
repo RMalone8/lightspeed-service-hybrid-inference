@@ -23,6 +23,7 @@ from ols.app.metrics.metrics import gen_ai_client_operation_duration_seconds
 from ols.app.metrics.token_counter import GenericTokenCounter
 from ols.app.models.config import ModelConfig
 from ols.app.models.models import RagChunk, StreamChunkType, StreamedChunk
+from ols.src.query_helpers.round_usage import RoundUsage, usage_from_chunk
 from ols.src.tools.tool_result_inspection import (
     INJECTION_CATEGORIES,
     ToolResultClassifier,
@@ -107,6 +108,7 @@ class RoundLLMResult:
     collected_text: list[str] = field(default_factory=list)
     collected_thinking: list[str] = field(default_factory=list)
     final_answer_suppressed: bool = False
+    usage: RoundUsage = field(default_factory=RoundUsage)
 
 
 def skip_special_chunk(
@@ -260,6 +262,7 @@ class LLMExecutionAgent:
         self._tool_result_classifier = tool_result_classifier
         self._tool_call_round_timeout = tool_call_round_timeout
         self._handoff_threshold_path = handoff_threshold_path
+        self._round_usage: list[dict[str, Any]] = []
 
     async def execute(
         self,
@@ -290,6 +293,7 @@ class LLMExecutionAgent:
             StreamedChunk objects representing parts of the response,
             ending with a StreamChunkType.END chunk.
         """
+        self._round_usage = []
         with TokenMetricUpdater(
             llm=self.bare_llm,
             provider=self.provider_type,
@@ -313,6 +317,7 @@ class LLMExecutionAgent:
                 "rag_chunks": rag_chunks,
                 "truncated": truncated,
                 "token_counter": token_counter.token_counter,
+                "round_usage": list(self._round_usage),
             },
         )
 
@@ -510,6 +515,7 @@ class LLMExecutionAgent:
                 )
                 return
             round_messages, round_tools, synthesize = round_request
+            handoff = self._handoff(synthesize)
             round_result = RoundLLMResult()
             turn_span = (
                 self._audit_ctx.span(
@@ -535,7 +541,7 @@ class LLMExecutionAgent:
                     round_index=i,
                     result=round_result,
                     synthesize=synthesize,
-                    handoff=self._handoff(synthesize),
+                    handoff=handoff,
                 ):
                     yield chunk
 
@@ -546,6 +552,8 @@ class LLMExecutionAgent:
                     prev_input_tokens,
                     prev_output_tokens,
                 )
+
+            self._round_usage.append(round_result.usage.to_record(i, handoff))
 
             if round_result.should_stop:
                 log_tool_loop_iteration(self._tracker, i, max_rounds, "llm_stream_stop")
@@ -943,6 +951,8 @@ class LLMExecutionAgent:
         stop flag while yielding ``StreamedChunk`` objects to the caller.
         """
         chunk_counter = 0
+        attempt_usage: Optional[dict[str, int]] = None
+        attempt_model: Optional[str] = None
         guard = _FinalAnswerToolCallGuard() if apply_final_answer_guard else None
         timeout_seconds = (
             self._tool_call_round_timeout or constants.TOOL_CALL_ROUND_TIMEOUT
@@ -984,6 +994,15 @@ class LLMExecutionAgent:
                         else:
                             yield StreamedChunk(type=StreamChunkType.TEXT, text=chunk)
                         break
+
+                    # The usage chunk follows the last text chunk, so read it before any
+                    # draining skips it.
+                    usage = usage_from_chunk(chunk)
+                    if usage is not None:
+                        attempt_usage = usage
+                    attempt_model = (
+                        chunk.response_metadata.get("model_name") or attempt_model
+                    )
 
                     # Once finish_reason="stop" is seen we keep draining
                     # the generator instead of breaking out — breaking would
@@ -1058,6 +1077,10 @@ class LLMExecutionAgent:
                 ),
             )
             result.should_stop = True
+        finally:
+            if attempt_usage is not None:
+                result.usage.add(attempt_usage)
+            result.usage.model = attempt_model or result.usage.model
 
     @staticmethod
     def _enrich_with_tool_metadata(

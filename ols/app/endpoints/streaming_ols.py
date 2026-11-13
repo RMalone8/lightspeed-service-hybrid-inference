@@ -207,6 +207,7 @@ def stream_end_event(
     media_type: str,
     token_counter: TokenCounter,
     available_quotas: dict[str, int],
+    round_usage: Optional[list[dict[str, Any]]] = None,
 ) -> str:
     """Yield the end of the data stream.
 
@@ -216,6 +217,7 @@ def stream_end_event(
         media_type: Media type of the response (e.g. text or JSON).
         token_counter: Token counter for the whole stream.
         available_quotas: Quotas available for configured quota limiters.
+        round_usage: Provider-reported token usage for each LLM round, when known.
     """
     if media_type == constants.MEDIA_TYPE_JSON:
         return format_stream_data(
@@ -227,6 +229,7 @@ def stream_end_event(
                     "input_tokens": calc_tokens(token_counter, "input_tokens"),
                     "output_tokens": calc_tokens(token_counter, "output_tokens"),
                     "reasoning_tokens": calc_tokens(token_counter, "reasoning_tokens"),
+                    **({"round_usage": round_usage} if round_usage is not None else {}),
                 },
                 "available_quotas": available_quotas,
             }
@@ -437,6 +440,7 @@ async def response_processing_wrapper(  # noqa: C901  # pylint: disable=R0912,R0
         idx: int = 0
         was_reasoning: bool = False
         token_counter: Optional[TokenCounter] = None
+        round_usage: Optional[list[dict[str, Any]]] = None
 
         try:
             async for item in generator:
@@ -529,6 +533,7 @@ async def response_processing_wrapper(  # noqa: C901  # pylint: disable=R0912,R0
                         rag_chunks = item.data["rag_chunks"]
                         history_truncated = item.data["truncated"]
                         token_counter = item.data["token_counter"]
+                        round_usage = item.data.get("round_usage")
                     case _:
                         msg = (
                             "Yielded unknown item type from streaming generator, "
@@ -602,6 +607,7 @@ async def response_processing_wrapper(  # noqa: C901  # pylint: disable=R0912,R0
                 media_type,
                 token_counter,
                 available_quotas,
+                round_usage,
             )
 
             timestamps["add references"] = time.time()

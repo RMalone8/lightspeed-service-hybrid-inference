@@ -4,12 +4,12 @@ import logging
 from typing import Any, Optional
 
 from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_openai import ChatOpenAI
 
 from ols import constants
 from ols.app.models.config import ModelParameters
 from ols.src.llms.providers.chat_vlllm_reasoning import ChatVLLMReasoning
 from ols.src.llms.providers.provider import LLMProvider
+from ols.src.llms.providers.raw_usage import ChatOpenAIRawUsage
 from ols.src.llms.providers.registry import register_llm_provider_as
 from ols.src.llms.providers.utils import populate_vllm_reasoning
 
@@ -44,6 +44,7 @@ class RHOAIVLLM(LLMProvider):
             "organization": None,
             "cache": None,
             "max_completion_tokens": 4096,
+            "stream_usage": True,
             "verbose": False,
             "http_client": self._construct_httpx_client(False),
             "http_async_client": self._construct_httpx_client(True),
@@ -64,4 +65,4 @@ class RHOAIVLLM(LLMProvider):
         # to preserve reasoning_content/reasoning
         if reasoning_config:
             return ChatVLLMReasoning(**self.params)
-        return ChatOpenAI(**self.params)
+        return ChatOpenAIRawUsage(**self.params)
