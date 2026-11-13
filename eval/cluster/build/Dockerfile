@@ -32,6 +32,8 @@ RUN pip install --no-cache-dir /opt/lightspeed-evaluation pyyaml \
 COPY eval /opt/hybrid/eval
 COPY examples/hybrid-inference/cpu-small/inferenceservice.yaml \
      /opt/hybrid/examples/hybrid-inference/cpu-small/inferenceservice.yaml
+COPY examples/hybrid-inference/gpu-large/inferenceservice.yaml \
+     /opt/hybrid/examples/hybrid-inference/gpu-large/inferenceservice.yaml
 
 RUN mkdir -p /results && chown -R 1001:0 /results /opt/hybrid && chmod -R g=u /results
 

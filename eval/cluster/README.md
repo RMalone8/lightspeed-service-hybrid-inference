@@ -79,6 +79,7 @@ optional (its flag is not passed when absent). Values come from the model's card
 | `tool_call_parser` | vLLM `--tool-call-parser` (adds `--enable-auto-tool-choice`), or `none` |
 | `reasoning_parser` | Optional vLLM `--reasoning-parser` |
 | `gated` | `true` to give the pod the `hf-token` secret as `HF_TOKEN` |
+| `external` | `true` for a model hosted outside the cluster; it sets only `model`. Nothing is patched for it (see "Models hosted outside the cluster") |
 
 **`judges:`** each judge once with `provider` and `model` (optional `temperature`,
 `max_completion_tokens`); an experiment names one or more, and every answer is scored by each.
@@ -143,6 +144,39 @@ For such an experiment the runner leaves the InferenceService alone and instead 
 
 Only `hosted_vllm` judges can be used this way. Re-run `oc apply -f eval/cluster/eval-runner.yaml` to
 grant the runner the Deployment and ConfigMap permissions this needs, and rebuild the image.
+
+A `models:` entry with `external: true` works the same way as an experiment's `model`, without needing a
+judge of that name. A judge whose model serves answers is removed from the panel either way.
+
+## Handoff experiments
+
+An experiment can test the hybrid setup: the CPU `model` answers until the tool calls and results have
+used `handoff_threshold` (0 to 1) of the tool token budget, and on the last round after tool calling; then
+OLS hands the calls to `handoff_endpoint`. See the example README for how handoff works.
+
+```yaml
+models:
+  deepseek-external: {model: rits/deepseek-ai/DeepSeek-V4.1-Flash-1017, external: true}
+experiments:
+  - name: "Hybrid - handoff at 0.5"
+    model: agentworld
+    handoff_endpoint: deepseek-external     # any model under `models:`
+    handoff_threshold: 0.5
+```
+
+- **`handoff_endpoint` external:** nothing is patched; Praxis sends the GPU side (handoff calls and
+  non-ask traffic) to the endpoint, as for an external `model`.
+- **`handoff_endpoint` local:** the `gpu-large` InferenceService is patched to serve that model (GPU
+  nodes only, not gated models) and the runner waits for it.
+- **`handoff_threshold`:** written to the `handoff_tool_budget` key of the `llmcreds-praxis` secret. The
+  operator rolls the app server (about a minute) and the runner checks the pod reads the value. An
+  experiment without a threshold sets it empty, which turns handoff off. The original value is restored
+  at the end.
+- **Requirements:** the runner image and the permissions in `eval-runner.yaml` (re-apply it), and an
+  OLS image where handoff is off unless that key holds a number. Run with Praxis on its standard
+  config, not `praxis/config-external.yaml`.
+- **Dedupe:** `handoff_endpoint` and `handoff_threshold` must be in `dedupe_on` (they are in the
+  defaults), or runs differing only in threshold count as the same.
 
 ## Sizing
 

@@ -1,0 +1,157 @@
+# Same routing as config.yaml, but everything that goes to gpu-large is served by a model hosted
+# outside the cluster (the deepseek judge in eval/cluster/experiments.yaml). cpu-small is unchanged.
+#
+# Do not edit the EXTERNAL_HOST and EXTERNAL_BASE_PATH placeholders by hand, and do not commit real
+# values. They are filled in from the eval-credentials secret when the ConfigMap is created. Run from
+# examples/hybrid-inference/praxis:
+#
+#   BASE=$(oc get secret eval-credentials -n openshift-lightspeed -o jsonpath='{.data.HOSTED_VLLM_API_BASE}' | base64 -d)
+#   HOST=$(printf '%s' "$BASE" | sed -E 's#^https?://([^/:]+).*#\1#')
+#   BASE_PATH=$(printf '%s' "$BASE" | sed -E 's#^https?://[^/]+##; s#/$##')
+#   sed -e "s#EXTERNAL_HOST#$HOST#g" -e "s#EXTERNAL_BASE_PATH#$BASE_PATH#g" config-external.yaml \
+#     | oc create configmap praxis-config-external -n openshift-lightspeed \
+#         --from-file=config.yaml=/dev/stdin --dry-run=client -o yaml | oc apply -f -
+#
+# Then switch Praxis to it. One patch sets the config and the key (an env var read from the same
+# secret), so the Deployment never runs with one and not the other:
+#
+#   oc patch deployment praxis -n openshift-lightspeed --type=strategic -p '{"spec":{"template":{"spec":{
+#     "volumes":[{"name":"config","configMap":{"name":"praxis-config-external"}}],
+#     "containers":[{"name":"praxis","env":[{"name":"HOSTED_VLLM_API_KEY","valueFrom":{"secretKeyRef":{
+#       "name":"eval-credentials","key":"HOSTED_VLLM_API_KEY"}}}]}]}}}}'
+#
+# To go back to the local GPU, patch the volume to the praxis-config-<hash> ConfigMap that
+# `oc get cm -n openshift-lightspeed | grep praxis-config` lists (not praxis-config-external):
+#
+#   oc patch deployment praxis -n openshift-lightspeed --type=strategic -p '{"spec":{"template":{"spec":{
+#     "volumes":[{"name":"config","configMap":{"name":"praxis-config-<hash>"}}]}}}}'
+#
+# The env var can stay when you switch back; the local config does not use it.
+#
+# Traffic that reaches gpu-large (and so the external endpoint): calls with X-OLS-Handoff: true, and
+# anything that is not ask mode, including requests with no mode header such as the OLS readiness check.
+# The rewrites below are conditioned on those same headers, so cpu-small requests are never touched.
+
+listeners:
+  - name: gateway
+    address: "0.0.0.0:8080"
+    filter_chains: [main]
+
+filter_chains:
+  - name: main
+    filters:
+      - filter: static_response
+        status: 200
+        headers:
+          - name: Content-Type
+            value: application/json
+        body: '{"status": "ok"}'
+        conditions:
+          - when:
+              path: "/healthz"
+
+      - filter: static_response
+        status: 200
+        headers:
+          - name: Content-Type
+            value: application/json
+        body: '{"object": "list", "data": [{"id": "hybrid-model", "object": "model", "created": 0, "owned_by": "praxis"}]}'
+        conditions:
+          - when:
+              path: "/v1/models"
+              methods: ["GET"]
+
+      # The external server knows the model by its own name and path. Applied to handoff calls ...
+      - filter: openai_responses_model_rewrite
+        model_aliases:
+          hybrid-model: rits/deepseek-ai/DeepSeek-V4.1-Flash-1017
+        conditions:
+          - when:
+              headers:
+                X-OLS-Handoff: "true"
+
+      - filter: path_rewrite
+        replace:
+          pattern: '^/v1/chat/completions$'
+          replacement: "EXTERNAL_BASE_PATH/chat/completions"
+        conditions:
+          - when:
+              headers:
+                X-OLS-Handoff: "true"
+
+      # ... and to everything that is not ask mode.
+      - filter: openai_responses_model_rewrite
+        model_aliases:
+          hybrid-model: rits/deepseek-ai/DeepSeek-V4.1-Flash-1017
+        conditions:
+          - unless:
+              headers:
+                X-OLS-Mode: "ask"
+
+      # Praxis rejects two path rewrites unless the later one allows the override. These two never
+      # match the same request (handoff calls are ask mode), so last-writer-wins is safe.
+      - filter: path_rewrite
+        allow_rewrite_override: true
+        replace:
+          pattern: '^/v1/chat/completions$'
+          replacement: "EXTERNAL_BASE_PATH/chat/completions"
+        conditions:
+          - unless:
+              headers:
+                X-OLS-Mode: "ask"
+
+      - filter: router
+        routes:
+          - path_prefix: "/"
+            headers:
+              X-OLS-Mode: "ask"
+              X-OLS-Handoff: "true"
+            cluster: gpu-large
+          - path_prefix: "/"
+            headers:
+              X-OLS-Mode: "ask"
+            cluster: cpu-small
+          - path_prefix: "/"
+            cluster: gpu-large
+
+      - filter: headers
+        request_set:
+          - name: Host
+            value: EXTERNAL_HOST
+        conditions:
+          - when:
+              headers:
+                X-OLS-Handoff: "true"
+
+      - filter: headers
+        request_set:
+          - name: Host
+            value: EXTERNAL_HOST
+        conditions:
+          - unless:
+              headers:
+                X-OLS-Mode: "ask"
+
+      # Adds the API key to requests for the gpu-large cluster only, replacing any caller credential.
+      - filter: credential_injection
+        clusters:
+          - name: gpu-large
+            header: Authorization
+            header_prefix: "Bearer "
+            env_var: HOSTED_VLLM_API_KEY
+            strip_client_credential: true
+
+      - filter: load_balancer
+        clusters:
+          - name: cpu-small
+            endpoints:
+              - "cpu-small-predictor.openshift-lightspeed.svc.cluster.local:8080"
+          - name: gpu-large
+            endpoints:
+              - "EXTERNAL_HOST:443"
+            tls:
+              sni: EXTERNAL_HOST
+
+insecure_options:
+  allow_private_endpoints: true
+  allow_private_upstreams: true

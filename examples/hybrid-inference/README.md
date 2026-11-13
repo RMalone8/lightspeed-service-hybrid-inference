@@ -19,29 +19,40 @@ after editing `praxis/config.yaml` rolls the Deployment.
 
 An `ask` query can make several calls, one per tool-calling round. `cpu-small` serves the early rounds,
 and OLS marks later calls with `X-OLS-Handoff: true`. The first Praxis route matches it together with
-`X-OLS-Mode: ask` and sends the call to `gpu-large`. OLS sends it on:
+`X-OLS-Mode: ask` and sends the call to `gpu-large`. Handoff is **off by default**. When it is on, OLS
+sends the header on:
 
 - the forced last round after tool calling, which writes the answer;
 - every call once the tool calls and their results have used a set fraction of the tool token budget
   (the context window times `tool_budget_ratio`), since the prompt each round resends keeps growing
-  with tool output. The fraction defaults to 0.5 (`HANDOFF_TOOL_BUDGET_FRACTION` in `ols/constants.py`).
+  with tool output.
 
 With tool calling off nothing is sent and `ask` stays on `cpu-small`. A model that stops calling tools
 before either point also answers on `cpu-small`.
 
-#### Changing the threshold
+#### Turning handoff on and setting the threshold
 
-The operator cannot pass new settings to OLS, so the fraction is read from a file in the provider's
-credentials directory: add a `handoff_tool_budget` key (a number from 0 to 1) to the credentials Secret.
-A missing or invalid value falls back to the default, with a warning in the OLS log for an invalid one.
+The operator cannot pass new settings to OLS, so both come from a file in the provider's credentials
+directory: the `handoff_tool_budget` key of the credentials Secret. A number from 0 to 1 turns handoff on
+at that fraction of the tool budget. A missing, empty or invalid value turns it off completely, including
+the last round (an invalid one also logs a warning).
 
 ```bash
 oc patch secret llmcreds-praxis -n openshift-lightspeed --type=merge \
-  -p '{"stringData":{"handoff_tool_budget":"0.4"}}'
+  -p '{"stringData":{"handoff_tool_budget":"0.4"}}'      # "" turns it off
 ```
 
 The operator rolls the app server whenever that Secret changes, so a new value takes effect in about a
-minute, with no image rebuild. Use `1` to hand off only on the last round, or `0` to hand off every call.
+minute, with no image rebuild. `1` hands off only on the last round (and when the budget is spent), and
+`0` hands off every call.
+
+### External model for the GPU side
+
+`praxis/config-external.yaml` is `config.yaml` with `gpu-large` replaced by a model hosted outside the
+cluster, with the model name, path and API key rewritten for it. It takes the endpoint from the
+`eval-credentials` secret (`HOSTED_VLLM_API_BASE`, `HOSTED_VLLM_API_KEY`) and the model from the judge
+in `eval/cluster/experiments.yaml`. Its header has the commands to create the ConfigMap, switch to it
+and switch back. It works only for OpenAI-compatible endpoints with a bearer key.
 
 ## Prerequisites
 

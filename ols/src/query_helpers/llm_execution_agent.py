@@ -246,8 +246,8 @@ class LLMExecutionAgent:
             tool_call_round_timeout: Optional per-round timeout in seconds. Falls
                 back to ``constants.TOOL_CALL_ROUND_TIMEOUT`` when unset.
             handoff_threshold_path: Optional file holding the fraction of the tool
-                budget at which calls are tagged for handoff; the default applies
-                when the file is missing or invalid.
+                budget at which calls are tagged for handoff. Handoff is off unless
+                it holds a number from 0 to 1.
         """
         self.bare_llm = bare_llm
         self.model = model
@@ -422,33 +422,47 @@ class LLMExecutionAgent:
         round_tools = [] if synthesize else all_mcp_tools
         return round_messages, round_tools, synthesize
 
-    def _handoff_fraction(self) -> float:
-        """Return the tool budget fraction that triggers handoff, as configured on disk."""
-        default = constants.HANDOFF_TOOL_BUDGET_FRACTION
-        if self._handoff_threshold_path is None:
-            return default
+    def _handoff_fraction(self) -> float | None:
+        """Return the tool budget fraction that turns on handoff, or None when it is off.
+
+        Handoff is on only when the threshold file holds a number from 0 to 1. A missing
+        or empty file, or an invalid value, turns it off.
+        """
+        path = self._handoff_threshold_path
+        if path is None:
+            return None
         try:
-            with open(self._handoff_threshold_path, encoding="utf-8") as f:
-                fraction = float(f.read().strip())
+            with open(path, encoding="utf-8") as f:
+                text = f.read().strip()
         except FileNotFoundError:
-            return default
-        except (OSError, ValueError):
-            logger.warning(
-                "Ignoring unreadable handoff threshold in %s",
-                self._handoff_threshold_path,
-            )
-            return default
+            return None
+        except OSError:
+            logger.warning("Ignoring unreadable handoff threshold in %s", path)
+            return None
+        if not text:
+            return None
+        try:
+            fraction = float(text)
+        except ValueError:
+            logger.warning("Ignoring invalid handoff threshold %r", text)
+            return None
         if not 0 <= fraction <= 1:
             logger.warning("Ignoring out-of-range handoff threshold %s", fraction)
-            return default
+            return None
         return fraction
 
-    def _tool_budget_handoff(self) -> bool:
-        """Return True once enough of the tool token budget is used to hand off."""
+    def _handoff(self, synthesize: bool) -> bool:
+        """Return True when this call should carry the handoff header.
+
+        Args:
+            synthesize: Whether this call writes the final answer after tool calling.
+        """
+        fraction = self._handoff_fraction()
+        if fraction is None:
+            return False
         budget = self._tracker.max_tool_tokens
-        return (
-            budget > 0
-            and self._tracker.tool_budget_used / budget >= self._handoff_fraction()
+        return synthesize or (
+            budget > 0 and self._tracker.tool_budget_used / budget >= fraction
         )
 
     async def _iterate_with_tools(  # noqa: C901
@@ -521,7 +535,7 @@ class LLMExecutionAgent:
                     round_index=i,
                     result=round_result,
                     synthesize=synthesize,
-                    handoff=synthesize or self._tool_budget_handoff(),
+                    handoff=self._handoff(synthesize),
                 ):
                     yield chunk
 

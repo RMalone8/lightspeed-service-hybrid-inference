@@ -41,10 +41,10 @@ designing any threshold logic in the gateway.
 | Header | Set by | Meaning |
 |---|---|---|
 | `X-OLS-Mode` | `DocsSummarizer._query_mode_llm_params` (`ols/src/query_helpers/docs_summarizer.py`) | `ask` or `troubleshooting`; fixed per client |
-| `X-OLS-Handoff: true` | `LLMExecutionAgent` (`ols/src/query_helpers/llm_execution_agent.py`) | per call: the forced last round after tool calling, or once the tool budget used reaches a threshold |
+| `X-OLS-Handoff: true` | `LLMExecutionAgent` (`ols/src/query_helpers/llm_execution_agent.py`) | per call, only when handoff is on: the forced last round after tool calling, or once the tool budget used reaches the threshold |
 
-Names and defaults live in `ols/constants.py` (`QUERY_MODE_HEADER`, `HANDOFF_HEADER`,
-`HANDOFF_TOOL_BUDGET_FRACTION`). Headers are sent only for `rhoai_vllm` providers.
+Names live in `ols/constants.py` (`QUERY_MODE_HEADER`, `HANDOFF_HEADER`). Headers are sent only for
+`rhoai_vllm` providers.
 
 Routes in `praxis/config.yaml` are first-match: `X-OLS-Handoff: true` -> `gpu-large`, then
 `X-OLS-Mode: ask` -> `cpu-small`, then everything else -> `gpu-large`. Calls with no mode header (for
@@ -54,19 +54,20 @@ and `GET /v1/models` itself.
 Things that look like LLM calls but are not tool rounds: history compression and the tool-result
 classifier. They use separate clients that carry only `X-OLS-Mode`, so they stay on `cpu-small`.
 
-### The handoff threshold
+### Handoff on/off and the threshold
 
-The fraction of the tool token budget (`context window x tool_budget_ratio`) at which calls are handed
-off is read from a file, `handoff_tool_budget`, in the provider's credentials directory, falling back to
-the default. That makes it a key in the credentials Secret. See the README's "Changing the threshold".
-The reason it is not a normal setting: the operator's `OLSConfig` CRD exposes no env vars, volumes or
+Handoff is off unless the `handoff_tool_budget` file in the provider's credentials directory (a key of the
+credentials Secret) holds a number from 0 to 1: the fraction of the tool token budget
+(`context window x tool_budget_ratio`) at which calls are handed off, with the last round handed off too.
+A missing, empty or invalid value turns it off entirely. See the README's "Turning handoff on and setting
+the threshold". It is a Secret key because the operator's `OLSConfig` CRD exposes no env vars, volumes or
 extra config for the app server (see "Operator constraints").
 
 ## Repo map (hybrid-relevant)
 
 | Path | What it is |
 |---|---|
-| `examples/hybrid-inference/` | Kustomize app: `cpu-small/`, `gpu-large/` (KServe InferenceService, ServingRuntime, PVC), `praxis/` (gateway config + Deployment), `ols/olsconfig.yaml`, `build/buildconfig.yaml` |
+| `examples/hybrid-inference/` | Kustomize app: `cpu-small/`, `gpu-large/` (KServe InferenceService, ServingRuntime, PVC), `praxis/` (gateway config + Deployment; `config-external.yaml` serves gpu-large from an external model), `ols/olsconfig.yaml`, `build/buildconfig.yaml` |
 | `examples/hybrid-inference/README.md` | Setup, node labels, routing test, custom image, handoff docs |
 | `ols/src/query_helpers/docs_summarizer.py`, `llm_execution_agent.py` | Where requests are tagged and the tool loop runs |
 | `ols/constants.py`, `ols/app/models/config.py` | Header names, defaults, provider/credentials config |
@@ -115,8 +116,18 @@ enough tool results to cross the threshold to exercise a handoff; heavy items fr
 `eval/eval_data.yaml` do this some of the time because the model chooses its own tool calls.
 
 **Run evaluations:** `eval/cluster/README.md` is the guide (`experiments.yaml` -> ConfigMap -> Job ->
-results). Each experiment restarts the CPU model pod. External-endpoint experiments temporarily patch
-Praxis and restore it afterwards.
+results). Each experiment restarts the CPU model pod. Experiments with an external model or a
+`handoff_endpoint` temporarily patch Praxis and restore it afterwards. `handoff_threshold` makes the runner
+set the handoff Secret key (rolling the app server) and, for a local `handoff_endpoint`, patch `gpu-large`;
+the runner restores the threshold at the end.
+
+**Serve the GPU side from an external model:** use `praxis/config-external.yaml`; its header has the
+commands (fill the host and path from `eval-credentials`, switch with one patch, go back with another).
+Only OpenAI-compatible endpoints with a bearer key work. Switch back to the standard config before
+running experiments: the runner builds its own external config from the live one.
+
+**Praxis config changes:** Praxis rejects an invalid config at startup, so the new pod crash-loops while the
+old one keeps serving. Read the new pod's log for the reason.
 
 ## Operator constraints (why some things look indirect)
 
@@ -139,6 +150,7 @@ Praxis and restore it afterwards.
   `tests/unit/query_helpers/test_llm_execution_agent.py`.
 - This is a fork (`RMalone8/lightspeed-service-hybrid-inference`), not upstream OLS: push to it and open PRs
   against it. The upstream Jira-prefixed commit rule in the root guide does not apply here.
+- Test on the cluster, not on the developer's machine; do not run Praxis or other services locally.
 - When hybrid behavior or the cluster workflow changes, update the example README and this file.
 
 ## Ask first

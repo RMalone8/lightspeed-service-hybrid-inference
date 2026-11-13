@@ -12,6 +12,7 @@ set from the Job's service account token, or from `oc whoami -t` when not in a p
 """
 
 import argparse
+import base64
 import copy
 import hashlib
 import json
@@ -193,19 +194,29 @@ def check_memory_pair(owner: str, entry: dict[str, Any]) -> None:
 
 
 def validate_models(models: dict[str, Any]) -> None:
-    """Every model needs its Hugging Face id and tool call parser; the rest is optional."""
+    """Every model needs its Hugging Face id and tool call parser; an external model needs only its id."""
     if not models:
         raise SystemExit("experiments file needs a `models:` section defining each model to test")
     for key, entry in models.items():
-        unsupported = sorted(set(entry or {}) - set(ALLOWED_MODEL_KEYS))
+        entry = entry or {}
+        unsupported = sorted(set(entry) - set(ALLOWED_MODEL_KEYS))
         if unsupported:
             raise SystemExit(
                 f"models.{key} has unsupported keys {unsupported}; supported: {list(ALLOWED_MODEL_KEYS)}. "
                 "CPU and memory are set once under `defaults`, and can be overridden per experiment."
             )
-        if "gated" in entry and not isinstance(entry["gated"], bool):
-            raise SystemExit(f"models.{key}.gated must be true or false, got {entry['gated']!r}")
-        missing = [k for k in REQUIRED_MODEL_KEYS if k not in (entry or {})]
+        for flag in ("gated", "external"):
+            if flag in entry and not isinstance(entry[flag], bool):
+                raise SystemExit(f"models.{key}.{flag} must be true or false, got {entry[flag]!r}")
+        if entry.get("external"):
+            extra = sorted(set(entry) - {"model", "external"})
+            if "model" not in entry or extra:
+                raise SystemExit(
+                    f"models.{key} is external, so it sets only `model` (its id at the endpoint) and "
+                    f"`external: true`; remove {extra or []}"
+                )
+            continue
+        missing = [k for k in REQUIRED_MODEL_KEYS if k not in entry]
         if missing:
             raise SystemExit(
                 f"models.{key} is missing {missing}. Each model must set "
@@ -424,7 +435,67 @@ def resolve_judges(cfg: dict[str, Any], registry: dict[str, Any]) -> dict[str, A
     }
 
 
-def resolve_external(cfg: dict[str, Any], registry: dict[str, Any]) -> dict[str, Any]:
+def resolve_handoff(cfg: dict[str, Any], models: dict[str, Any]) -> dict[str, Any]:
+    """Resolve `handoff_endpoint` (a model key) and `handoff_threshold` (0 to 1) for an experiment.
+
+    A threshold alone hands off to whatever gpu-large serves now. An endpoint needs a threshold.
+    No threshold means handoff is off.
+    """
+    endpoint, threshold = cfg.get("handoff_endpoint"), cfg.get("handoff_threshold")
+    if threshold is not None:
+        if isinstance(threshold, bool) or not isinstance(threshold, (int, float)) or not 0 <= threshold <= 1:
+            raise SystemExit(
+                f"Experiment {cfg['name']!r}: handoff_threshold must be a number from 0 to 1, got {threshold!r}"
+            )
+        threshold = float(threshold)
+    if endpoint is None:
+        return {**cfg, "handoff_entry": None, "handoff_threshold": threshold}
+    if threshold is None:
+        raise SystemExit(f"Experiment {cfg['name']!r} sets handoff_endpoint without handoff_threshold")
+    if endpoint not in models:
+        raise SystemExit(
+            f"Experiment {cfg['name']!r} uses handoff_endpoint {endpoint!r}, which is not defined under "
+            f"`models:`. Defined: {sorted(models)}"
+        )
+    entry = models[endpoint]
+    if entry.get("external"):
+        handoff = {"key": endpoint, "model": entry["model"], "external": True}
+    else:
+        if entry.get("gated"):
+            raise SystemExit(
+                f"Experiment {cfg['name']!r}: handoff_endpoint {endpoint!r} is gated; gated models are "
+                "not supported on the GPU side yet"
+            )
+        handoff = {
+            "key": endpoint,
+            "model": entry["model"],
+            "external": False,
+            "tool_call_parser": NO_PARSER if entry["tool_call_parser"] is None else str(entry["tool_call_parser"]),
+            "reasoning_parser": NO_PARSER if entry.get("reasoning_parser") is None else str(entry["reasoning_parser"]),
+        }
+    return {**cfg, "handoff_entry": handoff, "handoff_threshold": threshold}
+
+
+def exclude_serving_judges(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Drop judges whose model answers questions in this experiment: a model never judges itself."""
+    served = {cfg["model"]} if cfg.get("ask_endpoint") else set()
+    handoff = cfg.get("handoff_entry")
+    if handoff and handoff["external"]:
+        served.add(handoff["model"])
+    entries = [e for e in cfg["judge_entries"] if e["model"] not in served]
+    if len(entries) == len(cfg["judge_entries"]):
+        return cfg
+    if not entries:
+        raise SystemExit(
+            f"Experiment {cfg['name']!r}: no judge is left once the models serving it are removed "
+            "from its panel. List at least one other judge."
+        )
+    return {**cfg, "judge_entries": entries, "judge_names": [e["alias"] for e in entries]}
+
+
+def resolve_external(
+    cfg: dict[str, Any], registry: dict[str, Any], judge_registry: Optional[dict[str, Any]] = None
+) -> dict[str, Any]:
     """Turn `ask_endpoint: <judge name>` into a model hosted outside the cluster.
 
     The named judge's endpoint answers the ask questions, so it is removed from the panel:
@@ -444,7 +515,11 @@ def resolve_external(cfg: dict[str, Any], registry: dict[str, Any]) -> dict[str,
         )
     names = cfg.get("judges")
     names = [names] if isinstance(names, str) else list(names or [])
-    remaining = [n for n in names if n != alias]
+    judge_registry = registry if judge_registry is None else judge_registry
+    remaining = [
+        n for n in names
+        if n != alias and (judge_registry.get(n) or {}).get("model") != entry["model"]
+    ]
     if not remaining:
         raise SystemExit(
             f"Experiment {cfg['name']!r}: no judge is left once {alias!r} is removed from its panel. "
@@ -477,12 +552,18 @@ class NoAliasDumper(yaml.SafeDumper):
 
 
 def praxis_external_config(
-    original: dict[str, Any], model: str, base_url: str
+    original: dict[str, Any],
+    base_url: str,
+    ask_model: Optional[str] = None,
+    handoff_model: Optional[str] = None,
 ) -> dict[str, Any]:
-    """Return the Praxis config with ask requests sent to an external endpoint.
+    """Return the Praxis config with ask and/or handoff traffic sent to the external endpoint.
 
-    Requests with X-OLS-Mode: ask get their model name, path and Host rewritten and the API key
-    (read from the environment) injected, then go over TLS to the endpoint. Other traffic is untouched.
+    ask_model: plain ask requests (not handoff calls) go to the endpoint, served as this model.
+    handoff_model: everything that routes to gpu-large (handoff calls and non-ask traffic) goes to
+    the endpoint, served as this model.
+    Each gets its model name, path and Host rewritten and the API key (from the environment)
+    injected, then goes over TLS. Traffic for an unchanged side is untouched.
     """
     parsed = urllib.parse.urlparse(base_url)
     if parsed.scheme != "https" or not parsed.hostname:
@@ -490,60 +571,80 @@ def praxis_external_config(
     host = parsed.hostname
     port = parsed.port or 443
     base_path = parsed.path.rstrip("/")
-    only_ask = [{"when": {"headers": {PRAXIS_ASK_HEADER: PRAXIS_ASK_VALUE}}}]
+    ask_only = {PRAXIS_ASK_HEADER: PRAXIS_ASK_VALUE}
+    handoff_call = {PRAXIS_HANDOFF_HEADER: PRAXIS_HANDOFF_VALUE}
+    external = {"name": EXTERNAL_CLUSTER, "endpoints": [f"{host}:{port}"], "tls": {"sni": host}}
 
     config = copy.deepcopy(original)
     chain = next(c for c in config["filter_chains"] if any(f["filter"] == "router" for f in c["filters"]))
     filters = chain["filters"]
-    router_at = next(i for i, f in enumerate(filters) if f["filter"] == "router")
-
-    for route in filters[router_at]["routes"]:
-        if (route.get("headers") or {}).get(PRAXIS_ASK_HEADER) == PRAXIS_ASK_VALUE:
-            route["cluster"] = EXTERNAL_CLUSTER
+    router = next(f for f in filters if f["filter"] == "router")
     balancer = next(f for f in filters if f["filter"] == "load_balancer")
-    balancer["clusters"] = [c for c in balancer["clusters"] if c["name"] != EXTERNAL_CLUSTER] + [
-        {
-            "name": EXTERNAL_CLUSTER,
-            "endpoints": [f"{host}:{port}"],
-            "tls": {"sni": host},
-        }
-    ]
+    router_at, balancer_at = filters.index(router), filters.index(balancer)
 
-    before_router = [
-        {
-            "filter": "openai_responses_model_rewrite",
-            "model_aliases": {"hybrid-model": model},
-            "conditions": only_ask,
-        },
-        {
-            "filter": "path_rewrite",
-            "replace": {
-                "pattern": "^/v1/chat/completions$",
-                "replacement": f"{base_path}/chat/completions",
+    rewrites: list[tuple[list[dict[str, Any]], str]] = []
+    credential_clusters: list[str] = []
+    if ask_model:
+        for route in router["routes"]:
+            if (route.get("headers") or {}) == ask_only:
+                route["cluster"] = EXTERNAL_CLUSTER
+        balancer["clusters"] = [c for c in balancer["clusters"] if c["name"] != EXTERNAL_CLUSTER] + [external]
+        rewrites.append(([{"when": {"headers": ask_only}}, {"unless": {"headers": handoff_call}}], ask_model))
+        credential_clusters.append(EXTERNAL_CLUSTER)
+    if handoff_model:
+        if not any(c["name"] == GPU_CLUSTER for c in balancer["clusters"]):
+            raise SystemExit(f"The Praxis config has no {GPU_CLUSTER} cluster to point at the endpoint")
+        balancer["clusters"] = [
+            {**external, "name": GPU_CLUSTER} if c["name"] == GPU_CLUSTER else c for c in balancer["clusters"]
+        ]
+        rewrites.append(([{"when": {"headers": handoff_call}}], handoff_model))
+        rewrites.append(([{"unless": {"headers": ask_only}}], handoff_model))
+        credential_clusters.append(GPU_CLUSTER)
+
+    before_router: list[dict[str, Any]] = []
+    before_balancer: list[dict[str, Any]] = []
+    for conditions, model in rewrites:
+        before_router += [
+            {
+                "filter": "openai_responses_model_rewrite",
+                "model_aliases": {"hybrid-model": model},
+                "conditions": conditions,
             },
-            "conditions": only_ask,
-        },
-    ]
-    before_balancer = [
-        {
-            "filter": "headers",
-            "request_set": [{"name": "Host", "value": host}],
-            "conditions": only_ask,
-        },
+            {
+                "filter": "path_rewrite",
+                "replace": {
+                    "pattern": "^/v1/chat/completions$",
+                    "replacement": f"{base_path}/chat/completions",
+                },
+                "conditions": conditions,
+            },
+        ]
+        before_balancer.append(
+            {"filter": "headers", "request_set": [{"name": "Host", "value": host}], "conditions": conditions}
+        )
+    # Praxis rejects several path rewrites unless the later ones allow the override. These conditions
+    # never match the same request, so last-writer-wins is safe.
+    first_path_rewrite = True
+    for rewrite in before_router:
+        if rewrite["filter"] == "path_rewrite":
+            if not first_path_rewrite:
+                rewrite["allow_rewrite_override"] = True
+            first_path_rewrite = False
+    before_balancer.append(
         {
             "filter": "credential_injection",
             "clusters": [
                 {
-                    "name": EXTERNAL_CLUSTER,
+                    "name": name,
                     "header": "Authorization",
                     "header_prefix": "Bearer ",
                     "env_var": EXTERNAL_KEY_ENV,
                     "strip_client_credential": True,
                 }
+                for name in credential_clusters
             ],
-        },
-    ]
-    balancer_at = filters.index(balancer)
+        }
+    )
     chain["filters"] = (
         filters[:router_at]
         + before_router
@@ -583,7 +684,10 @@ def route_praxis_externally(cfg: dict[str, Any], results: Path) -> None:
     original_name = annotations.get(ORIGINAL_CONFIG_ANNOTATION) or praxis_volume_config(deployment)
     original_map = oc_json("get", "configmap", original_name, "-n", namespace)
     original = yaml.safe_load(original_map["data"][PRAXIS_CONFIG_FILE])
-    rendered = praxis_external_config(original, cfg["model"], base_url)
+    handoff = cfg.get("handoff_entry")
+    ask_model = cfg["model"] if cfg.get("ask_endpoint") else None
+    handoff_model = handoff["model"] if handoff and handoff["external"] else None
+    rendered = praxis_external_config(original, base_url, ask_model, handoff_model)
     text = yaml.dump(rendered, Dumper=NoAliasDumper, sort_keys=False)
     digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:10]
     name = f"{original_name.rsplit('-', 1)[0]}-external-{digest}"
@@ -612,7 +716,10 @@ def route_praxis_externally(cfg: dict[str, Any], results: Path) -> None:
             }],
         }}},
     })
-    print(f"Praxis routes ask requests to the external endpoint for {cfg['model']}")
+    if ask_model:
+        print(f"Praxis routes ask requests to the external endpoint for {ask_model}")
+    if handoff_model:
+        print(f"Praxis routes the GPU side (handoff and non-ask requests) to the external endpoint for {handoff_model}")
 
 
 def apply_manifest(manifest: dict[str, Any]) -> None:
@@ -646,6 +753,91 @@ def restore_praxis(cfg: dict[str, Any]) -> None:
     print("Praxis restored to its original config")
 
 
+def handoff_secret_value() -> Optional[str]:
+    """The handoff threshold in the credentials secret, or None when the key is absent."""
+    data = oc_json("get", "secret", HANDOFF_SECRET, "-n", NAMESPACE_DEFAULT)["data"]
+    raw = data.get(HANDOFF_KEY)
+    return None if raw is None else base64.b64decode(raw).decode("utf-8")
+
+
+def handoff_in_pod(namespace: str) -> Optional[str]:
+    """What a running OLS app-server pod reads as the handoff threshold, or None if no pod is ready."""
+    pods = oc_json("get", "pods", "-n", namespace, "-l", APP_SERVER_SELECTOR)["items"]
+    for pod in pods:
+        statuses = pod["status"].get("containerStatuses", [])
+        if pod["status"].get("phase") != "Running" or not all(s.get("ready") for s in statuses):
+            continue
+        out = oc(
+            "exec", pod["metadata"]["name"], "-n", namespace, "-c", APP_SERVER_CONTAINER, "--",
+            "sh", "-c", f"cat {HANDOFF_FILE} 2>/dev/null; true", check=False,
+        )
+        return out.strip()
+    return None
+
+
+def set_handoff(cfg: dict[str, Any], value: Optional[str]) -> None:
+    """Set the handoff threshold in the credentials secret and wait until OLS reads it.
+
+    value: a number as text to turn handoff on, "" to turn it off, None to remove the key. The
+    operator rolls the app server when the secret changes. The first change records the original
+    value on the Praxis Deployment so restore_handoff can put it back, even after a killed Job.
+    """
+    namespace = cfg["namespace"]
+    current = handoff_secret_value()
+    if (current or "").strip() == (value or "").strip():
+        return
+    deployment = praxis_deployment(cfg)
+    if ORIGINAL_HANDOFF_ANNOTATION not in (deployment["metadata"].get("annotations") or {}):
+        oc(
+            "annotate", "deployment", deployment["metadata"]["name"], "-n", namespace,
+            f"{ORIGINAL_HANDOFF_ANNOTATION}={HANDOFF_UNSET if current is None else current}",
+        )
+    app_server = oc_json("get", "deployment", APP_SERVER_DEPLOYMENT, "-n", namespace)
+    marker = (app_server["spec"]["template"]["metadata"].get("annotations") or {}).get(RELOAD_ANNOTATION, "")
+    patch = {"data": {HANDOFF_KEY: None}} if value is None else {"stringData": {HANDOFF_KEY: value}}
+    oc("patch", "secret", HANDOFF_SECRET, "-n", namespace, "--type=merge", "-p", json.dumps(patch))
+    print(f"Handoff threshold set to {value!r}; waiting for OLS to restart with it")
+    deadline = time.time() + 600
+    while time.time() < deadline:
+        time.sleep(10)
+        app_server = oc_json("get", "deployment", APP_SERVER_DEPLOYMENT, "-n", namespace)
+        now = (app_server["spec"]["template"]["metadata"].get("annotations") or {}).get(RELOAD_ANNOTATION, "")
+        status, replicas = app_server["status"], app_server["spec"]["replicas"]
+        if now == marker or not (
+            status.get("updatedReplicas") == status.get("readyReplicas") == status.get("replicas") == replicas
+        ):
+            continue
+        if handoff_in_pod(namespace) == (value or "").strip():
+            print("OLS is running with the new handoff threshold")
+            return
+    raise SystemExit("Timed out waiting for OLS to pick up the handoff threshold")
+
+
+def restore_handoff(cfg: dict[str, Any]) -> None:
+    """Put the handoff threshold back to what it was before the runner changed it; no-op if unchanged."""
+    deployment = praxis_deployment(cfg)
+    original = (deployment["metadata"].get("annotations") or {}).get(ORIGINAL_HANDOFF_ANNOTATION)
+    if original is None:
+        return
+    set_handoff(cfg, None if original == HANDOFF_UNSET else original)
+    oc(
+        "annotate", "deployment", deployment["metadata"]["name"], "-n", cfg["namespace"],
+        f"{ORIGINAL_HANDOFF_ANNOTATION}-",
+    )
+    print("Handoff threshold restored")
+
+
+def handoff_label(cfg: dict[str, Any]) -> str:
+    """Short description of an experiment's handoff setting for the plan output."""
+    threshold, entry = cfg.get("handoff_threshold"), cfg.get("handoff_entry")
+    if threshold is None:
+        return "off"
+    where = "gpu-large as deployed"
+    if entry:
+        where = f"external {entry['model']}" if entry["external"] else f"gpu-large serving {entry['model']}"
+    return f"at {threshold:g} of the tool budget -> {where}"
+
+
 def judges_label(cfg: dict[str, Any]) -> str:
     """Short description of the judge panel for the plan output."""
     models = [e["model"] for e in cfg["judge_entries"]]
@@ -657,7 +849,9 @@ def check_judge_credentials(experiments: list[dict[str, Any]]) -> None:
     missing = sorted({
         (e["provider"], var)
         for cfg in experiments
-        for e in cfg["judge_entries"] + ([cfg["ask_entry"]] if cfg.get("ask_entry") else [])
+        for e in cfg["judge_entries"]
+        + ([cfg["ask_entry"]] if cfg.get("ask_entry") else [])
+        + ([{"provider": EXTERNAL_PROVIDER}] if (cfg.get("handoff_entry") or {}).get("external") else [])
         for var in PROVIDER_ENV.get(e["provider"], [])
         if not os.environ.get(var)
     })
@@ -755,6 +949,44 @@ def render_manifest(base: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]
     return manifest
 
 
+def render_gpu_manifest(base: dict[str, Any], entry: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
+    """Return the base gpu-large InferenceService serving one handoff model; resources are unchanged."""
+    manifest = copy.deepcopy(base)
+    model = manifest["spec"]["predictor"]["model"]
+    args = [
+        a for a in model.get("args", [])
+        if not a.startswith(VLLM_ARG_PREFIXES + PARSER_ARG_PREFIXES)
+        and a != "--enable-auto-tool-choice"
+    ]
+    head = [
+        f"--model={entry['model']}",
+        f"--served-model-name={cfg['served_model_name']}",
+        f"--max-model-len={cfg['max_model_len']}",
+    ]
+    if entry["tool_call_parser"] != NO_PARSER:
+        head += ["--enable-auto-tool-choice", f"--tool-call-parser={entry['tool_call_parser']}"]
+    if entry["reasoning_parser"] != NO_PARSER:
+        head.append(f"--reasoning-parser={entry['reasoning_parser']}")
+    model["args"] = head + args
+    return manifest
+
+
+def patch_gpu_model(cfg: dict[str, Any], entry: dict[str, Any], results: Path) -> None:
+    """Serve the handoff model on the gpu-large InferenceService and wait until it is ready."""
+    gpu = {**cfg, "isvc": cfg.get("gpu_isvc", GPU_CLUSTER)}
+    base = yaml.safe_load(expand(cfg["gpu_base_manifest"]).read_text(encoding="utf-8"))
+    rendered_dir = results / "rendered_manifests"
+    rendered_dir.mkdir(exist_ok=True)
+    rendered = rendered_dir / f"{slug(cfg['name'])}_gpu.yaml"
+    rendered.write_text(yaml.safe_dump(render_gpu_manifest(base, entry, cfg), sort_keys=False))
+    generation_before = isvc_generation(gpu)
+    applied_at = datetime.now(timezone.utc)
+    print(oc("apply", "-f", str(rendered)).strip())
+    restarted = isvc_generation(gpu) != generation_before
+    pod = wait_until_ready(gpu, applied_at, restarted)
+    print(f"GPU pod {pod} ready serving {entry['model']}")
+
+
 def slug(name: str) -> str:
     """Make a filesystem-safe name."""
     return re.sub(r"[^A-Za-z0-9]+", "_", name).strip("_").lower()
@@ -834,16 +1066,19 @@ def cluster_token() -> str:
 FINGERPRINT_KEYS = (
     "model", "cores", "max_model_len", "dataset", "extra_args", "extra_env",
     "cpu_limit", "judges", "thinking", "tool_call_parser", "reasoning_parser", "ask_endpoint",
+    "handoff_endpoint", "handoff_threshold",
 )
 DEFAULT_DEDUPE_ON = [
     "model", "cores", "max_model_len", "dataset", "judges", "thinking",
-    "tool_call_parser", "reasoning_parser", "ask_endpoint",
+    "tool_call_parser", "reasoning_parser", "ask_endpoint", "handoff_endpoint", "handoff_threshold",
 ]
 LEGACY_DEFAULTS = {
     "thinking": False,
     "tool_call_parser": "qwen3_coder",
     "reasoning_parser": "qwen3",
     "ask_endpoint": None,
+    "handoff_endpoint": None,
+    "handoff_threshold": None,
 }
 REQUIRED_JUDGE_KEYS = ("provider", "model")
 EXTERNAL_PROVIDER = "hosted_vllm"
@@ -855,6 +1090,19 @@ PRAXIS_CONFIG_FILE = "config.yaml"
 PRAXIS_ASK_HEADER = "X-OLS-Mode"
 PRAXIS_ASK_VALUE = "ask"
 EXTERNAL_CLUSTER = "external"
+GPU_CLUSTER = "gpu-large"
+NAMESPACE_DEFAULT = "openshift-lightspeed"
+PRAXIS_HANDOFF_HEADER = "X-OLS-Handoff"
+PRAXIS_HANDOFF_VALUE = "true"
+HANDOFF_SECRET = "llmcreds-praxis"
+HANDOFF_KEY = "handoff_tool_budget"
+HANDOFF_FILE = "/etc/apikeys/llmcreds-praxis/handoff_tool_budget"
+APP_SERVER_DEPLOYMENT = "lightspeed-app-server"
+APP_SERVER_SELECTOR = "app.kubernetes.io/name=lightspeed-service-api"
+APP_SERVER_CONTAINER = "lightspeed-service-api"
+RELOAD_ANNOTATION = "ols.openshift.io/force-reload"
+ORIGINAL_HANDOFF_ANNOTATION = "hybrid-eval/original-handoff-threshold"
+HANDOFF_UNSET = "<unset>"
 ORIGINAL_CONFIG_ANNOTATION = "hybrid-eval/original-praxis-config"
 EXTERNAL_CONFIG_LABEL = "hybrid-eval/praxis-external"
 ROLLOUT_TIMEOUT = "300s"
@@ -864,7 +1112,7 @@ PROVIDER_ENV = {
     "openai": ["OPENAI_API_KEY"],
 }
 REQUIRED_MODEL_KEYS = ("model", "tool_call_parser")
-ALLOWED_MODEL_KEYS = ("model", "tool_call_parser", "reasoning_parser", "gated")
+ALLOWED_MODEL_KEYS = ("model", "tool_call_parser", "reasoning_parser", "gated", "external")
 HF_TOKEN_ENV = "HF_TOKEN"
 HF_TOKEN_SECRET = "hf-token"
 HF_TOKEN_KEY = "HF_TOKEN"
@@ -948,6 +1196,8 @@ def fingerprint(cfg: dict[str, Any], effective_cores: Optional[list[int]] = None
         "tool_call_parser": cfg.get("tool_call_parser"),
         "reasoning_parser": cfg.get("reasoning_parser"),
         "ask_endpoint": cfg.get("ask_endpoint"),
+        "handoff_endpoint": (cfg.get("handoff_entry") or {}).get("model"),
+        "handoff_threshold": cfg.get("handoff_threshold"),
     }
 
 
@@ -1012,10 +1262,13 @@ def run_experiment(cfg: dict[str, Any], base: dict[str, Any]) -> None:
     results = expand(cfg["results_dir"])
     results.mkdir(parents=True, exist_ok=True)
     external = bool(cfg.get("ask_endpoint"))
-    if external:
+    handoff_entry = cfg.get("handoff_entry")
+    handoff_external = bool(handoff_entry and handoff_entry["external"])
+    if external or handoff_external:
         route_praxis_externally(cfg, results)
     else:
         restore_praxis(cfg)
+    if not external:
         rendered_dir = results / "rendered_manifests"
         rendered_dir.mkdir(exist_ok=True)
         rendered = rendered_dir / f"{slug(cfg['name'])}.yaml"
@@ -1030,6 +1283,11 @@ def run_experiment(cfg: dict[str, Any], base: dict[str, Any]) -> None:
         binding = check_binding(cfg, pod)
         print(f"Pod {pod} ready; vLLM threads: {binding.get('vllm_omp_threads')} "
               f"on {binding.get('vllm_omp_core_ids')}")
+
+    if handoff_entry and not handoff_external:
+        patch_gpu_model(cfg, handoff_entry, results)
+    threshold = cfg.get("handoff_threshold")
+    set_handoff(cfg, "" if threshold is None else format(threshold, "g"))
 
     env = dict(os.environ)
     env["API_KEY"] = cluster_token()
@@ -1058,6 +1316,11 @@ def run_experiment(cfg: dict[str, Any], base: dict[str, Any]) -> None:
         else:
             meta = collect(cfg["isvc"], cfg["namespace"])
         meta["name"] = cfg["name"]
+        meta["handoff"] = {
+            "threshold": cfg.get("handoff_threshold"),
+            "endpoint": handoff_entry["model"] if handoff_entry else None,
+            "hosting": None if not handoff_entry else ("external" if handoff_external else "local"),
+        }
         meta["judges"] = [
             {k: v for k, v in judge.items() if v is not None} for judge in cfg["judge_entries"]
         ]
@@ -1099,10 +1362,19 @@ def main() -> None:
     validate_models(models)
     judge_registry = spec.get("judges") or {}
     validate_judges(judge_registry)
+    external_models = {
+        key: {"provider": EXTERNAL_PROVIDER, "model": entry["model"]}
+        for key, entry in models.items() if entry.get("external")
+    }
     experiments = []
     for entry in spec.get("experiments", []):
         merged = {**defaults, **entry, **overrides}
-        if merged.get("ask_endpoint"):
+        if merged.get("model") in external_models:
+            if merged.get("ask_endpoint"):
+                raise SystemExit(f"Experiment {merged['name']!r} sets both an external `model` and `ask_endpoint`")
+            merged["ask_endpoint"] = merged.pop("model")
+            resolved = resolve_external(merged, external_models, judge_registry)
+        elif merged.get("ask_endpoint"):
             if "model" in entry:
                 raise SystemExit(
                     f"Experiment {merged['name']!r} sets both `model` and `ask_endpoint`; "
@@ -1111,7 +1383,8 @@ def main() -> None:
             resolved = resolve_external(merged, judge_registry)
         else:
             resolved = resolve_model(merged, models)
-        experiments.append(resolve_judges(resolved, judge_registry))
+        resolved = resolve_handoff(resolved, models)
+        experiments.append(exclude_serving_judges(resolve_judges(resolved, judge_registry)))
     if args.only:
         experiments = [e for e in experiments if e["name"] == args.only]
     if not experiments:
@@ -1130,7 +1403,8 @@ def main() -> None:
             print(f"  - {cfg['name']}")
             print(f"      external: ask requests go to the {cfg['ask_endpoint']} endpoint "
                   f"({cfg['model']}) via Praxis, key from the {CREDENTIALS_SECRET} secret")
-            print(f"      judges={judges_label(cfg)}  (excludes {cfg['ask_endpoint']})")
+            print(f"      judges={judges_label(cfg)}  (excludes the models serving answers)")
+            print(f"      handoff: {handoff_label(cfg)}")
             print(f"      dataset={dataset_label(cfg)}")
             continue
         model = render_manifest(base, cfg)["spec"]["predictor"]["model"]
@@ -1142,6 +1416,7 @@ def main() -> None:
               f"cpu={cfg['cpu_request']}/{cfg['cpu_limit']}  memory={cfg['memory_request']}/{cfg['memory_limit']}  "
               f"thinking={cfg['thinking']}  "
               f"judges={judges_label(cfg)}")
+        print(f"      handoff: {handoff_label(cfg)}")
         print(f"      dataset={dataset_label(cfg)}")
     print("\nMemory check (checkpoint size from Hugging Face; suggested = max(checkpoint x 1.25 + 8, 32) GiB):")
     print("\n".join(memory_report(local)) if local else "  no local experiments")
@@ -1186,8 +1461,10 @@ def main() -> None:
             run_experiment(cfg, base)
             finished = completed_runs(expand(cfg["results_dir"]))
     finally:
-        if any(cfg.get("ask_endpoint") for cfg in pending):
+        if any(cfg.get("ask_endpoint") or (cfg.get("handoff_entry") or {}).get("external") for cfg in pending):
             restore_praxis(experiments[0])
+        if pending:
+            restore_handoff(experiments[0])
 
 
 if __name__ == "__main__":

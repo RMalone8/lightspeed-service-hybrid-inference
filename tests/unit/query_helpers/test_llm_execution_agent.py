@@ -2302,11 +2302,23 @@ async def test_invoke_llm_omits_handoff_header(
     assert llm.bind_kwargs == []
 
 
+def _handoff_agent(tmp_path: Any, content: str | None) -> LLMExecutionAgent:
+    """Create an agent whose handoff threshold file holds ``content`` (None: no file)."""
+    path = tmp_path / constants.HANDOFF_THRESHOLD_FILENAME
+    if content is not None:
+        path.write_text(content)
+    return _make_agent(
+        provider_type=constants.PROVIDER_RHOAI_VLLM, handoff_threshold_path=str(path)
+    )
+
+
 async def _handoff_flags(
-    tools: list[Any], max_rounds: int, tool_tokens_after_first_round: int = 0
+    agent: LLMExecutionAgent,
+    tools: list[Any],
+    max_rounds: int,
+    tool_tokens_after_first_round: int = 0,
 ) -> list[bool]:
     """Run the loop with scripted rounds; return the handoff flag per LLM call."""
-    agent = _make_agent(provider_type=constants.PROVIDER_RHOAI_VLLM)
     flags: list[bool] = []
 
     async def _fake_invoke(*args: Any, **kwargs: Any) -> Any:
@@ -2346,95 +2358,142 @@ async def _handoff_flags(
     return flags
 
 
+@pytest.mark.parametrize("content", [None, "", "  \n", "oops", "1.5", "-0.1", "nan"])
 @pytest.mark.asyncio
-async def test_only_final_round_hands_off_when_tool_budget_is_low() -> None:
-    """Below the budget fraction only the forced final round is handed off."""
-    flags = await _handoff_flags(mock_tools_map, max_rounds=3)
-    assert flags == [False, False, True]
+async def test_no_handoff_when_the_threshold_is_missing_empty_or_invalid(
+    tmp_path: Any, content: str | None
+) -> None:
+    """Without a valid threshold nothing is handed off, not even the last round."""
+    agent = _handoff_agent(tmp_path, content)
+    assert await _handoff_flags(agent, mock_tools_map, max_rounds=3) == [False] * 3
 
 
 @pytest.mark.asyncio
-async def test_handoff_starts_once_tool_budget_fraction_is_used() -> None:
-    """Crossing the tool budget fraction hands off every later round."""
-    used = int(50000 * constants.HANDOFF_TOOL_BUDGET_FRACTION)
+async def test_no_handoff_without_a_threshold_path() -> None:
+    """An agent with no threshold path never hands off."""
+    agent = _make_agent(provider_type=constants.PROVIDER_RHOAI_VLLM)
+    assert await _handoff_flags(agent, mock_tools_map, max_rounds=3) == [False] * 3
+
+
+@pytest.mark.asyncio
+async def test_only_final_round_hands_off_when_tool_budget_is_low(
+    tmp_path: Any,
+) -> None:
+    """With handoff on and a low budget, only the forced final round is handed off."""
+    agent = _handoff_agent(tmp_path, "0.5")
+    assert await _handoff_flags(agent, mock_tools_map, max_rounds=3) == [
+        False,
+        False,
+        True,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_handoff_starts_once_tool_budget_fraction_is_used(tmp_path: Any) -> None:
+    """Crossing the configured fraction hands off every later round."""
+    agent = _handoff_agent(tmp_path, "0.5")
     flags = await _handoff_flags(
-        mock_tools_map, max_rounds=4, tool_tokens_after_first_round=used
+        agent,
+        mock_tools_map,
+        max_rounds=4,
+        tool_tokens_after_first_round=agent._tracker.max_tool_tokens // 2,
     )
     assert flags == [False, True, True, True]
 
 
 @pytest.mark.asyncio
-async def test_no_handoff_without_tools() -> None:
+async def test_no_handoff_without_tools(tmp_path: Any) -> None:
     """With no tools bound nothing is marked, so the call stays on the primary."""
-    assert await _handoff_flags([], max_rounds=3) == [False]
-
-
-def test_tool_budget_handoff_with_no_tool_budget() -> None:
-    """An agent with no tool budget never hands off on budget."""
-    agent = _make_agent()
-    agent._tracker.max_tool_tokens = 0
-    assert agent._tool_budget_handoff() is False
-
-
-def _threshold_agent(tmp_path: Any, content: str | None) -> LLMExecutionAgent:
-    """Create an agent whose handoff threshold file holds ``content`` (None: missing)."""
-    path = tmp_path / constants.HANDOFF_THRESHOLD_FILENAME
-    if content is not None:
-        path.write_text(content)
-    agent = _make_agent(handoff_threshold_path=str(path))
-    agent._tracker.max_tool_tokens = 8192
-    return agent
-
-
-def test_handoff_fraction_defaults_without_a_threshold_path() -> None:
-    """No threshold path means the built-in default."""
-    assert _make_agent()._handoff_fraction() == constants.HANDOFF_TOOL_BUDGET_FRACTION
+    agent = _handoff_agent(tmp_path, "0.5")
+    assert await _handoff_flags(agent, [], max_rounds=3) == [False]
 
 
 @pytest.mark.parametrize(
     ("content", "expected"),
     [
-        (None, constants.HANDOFF_TOOL_BUDGET_FRACTION),
+        (None, None),
+        ("", None),
+        ("  \n", None),
+        ("not-a-number", None),
+        ("1.5", None),
+        ("-0.1", None),
+        ("nan", None),
         ("0.3\n", 0.3),
         ("  0.75  ", 0.75),
         ("0", 0.0),
         ("1", 1.0),
-        ("not-a-number", constants.HANDOFF_TOOL_BUDGET_FRACTION),
-        ("", constants.HANDOFF_TOOL_BUDGET_FRACTION),
-        ("1.5", constants.HANDOFF_TOOL_BUDGET_FRACTION),
-        ("-0.1", constants.HANDOFF_TOOL_BUDGET_FRACTION),
     ],
 )
 def test_handoff_fraction_reads_the_threshold_file(
-    tmp_path: Any, content: str | None, expected: float
+    tmp_path: Any, content: str | None, expected: float | None
 ) -> None:
-    """A valid file overrides the default; missing or invalid files fall back to it."""
-    assert _threshold_agent(tmp_path, content)._handoff_fraction() == expected
+    """A valid number turns handoff on; anything else turns it off."""
+    assert _handoff_agent(tmp_path, content)._handoff_fraction() == expected
+
+
+def test_handoff_fraction_is_off_without_a_threshold_path() -> None:
+    """No threshold path means handoff is off."""
+    assert _make_agent()._handoff_fraction() is None
 
 
 def test_handoff_fraction_follows_changes_to_the_file(tmp_path: Any) -> None:
     """A rewritten file is picked up without recreating the agent."""
-    agent = _threshold_agent(tmp_path, "0.2")
+    agent = _handoff_agent(tmp_path, "0.2")
+    path = tmp_path / constants.HANDOFF_THRESHOLD_FILENAME
     assert agent._handoff_fraction() == 0.2
-    (tmp_path / constants.HANDOFF_THRESHOLD_FILENAME).write_text("0.8")
+    path.write_text("")
+    assert agent._handoff_fraction() is None
+    path.write_text("0.8")
     assert agent._handoff_fraction() == 0.8
 
 
-def test_invalid_handoff_threshold_is_logged(tmp_path: Any, caplog: Any) -> None:
-    """An unreadable threshold is reported, not silently ignored."""
+@pytest.mark.parametrize("content", ["oops", "1.5"])
+def test_invalid_handoff_threshold_is_logged(
+    tmp_path: Any, caplog: Any, content: str
+) -> None:
+    """An invalid threshold is reported, not silently ignored."""
     with caplog.at_level(logging.WARNING):
-        _threshold_agent(tmp_path, "oops")._handoff_fraction()
-    assert "Ignoring unreadable handoff threshold" in caplog.text
+        _handoff_agent(tmp_path, content)._handoff_fraction()
+    assert "Ignoring" in caplog.text
+
+
+@pytest.mark.parametrize("content", [None, ""])
+def test_missing_or_empty_handoff_threshold_is_not_logged(
+    tmp_path: Any, caplog: Any, content: str | None
+) -> None:
+    """Handoff being off is normal, so it is not a warning."""
+    with caplog.at_level(logging.WARNING):
+        _handoff_agent(tmp_path, content)._handoff_fraction()
+    assert caplog.text == ""
 
 
 @pytest.mark.parametrize(
-    ("content", "expected"),
-    [(None, True), ("0.3", True), ("0.9", False)],
+    ("content", "synthesize", "used", "expected"),
+    [
+        (None, True, 8192, False),
+        ("", True, 8192, False),
+        ("0.5", False, 0, False),
+        ("0.5", False, 4096, True),
+        ("0.5", False, 4095, False),
+        ("0.9", False, 4413, False),
+        ("0.3", False, 4413, True),
+        ("0.9", True, 0, True),
+        ("0", False, 0, True),
+    ],
 )
-def test_tool_budget_handoff_uses_the_configured_fraction(
-    tmp_path: Any, content: str | None, expected: bool
+def test_handoff_uses_the_configured_fraction(
+    tmp_path: Any, content: str | None, synthesize: bool, used: int, expected: bool
 ) -> None:
-    """With 4413 of 8192 tool tokens used (54%), the file decides whether to hand off."""
-    agent = _threshold_agent(tmp_path, content)
-    agent._tracker.charge(TokenCategory.TOOL_RESULT, 4413)
-    assert agent._tool_budget_handoff() is expected
+    """Handoff needs a valid threshold, then the last round or enough budget used."""
+    agent = _handoff_agent(tmp_path, content)
+    agent._tracker.max_tool_tokens = 8192
+    agent._tracker.charge(TokenCategory.TOOL_RESULT, used)
+    assert agent._handoff(synthesize) is expected
+
+
+def test_handoff_with_no_tool_budget(tmp_path: Any) -> None:
+    """With no tool budget only the last round after tool calling is handed off."""
+    agent = _handoff_agent(tmp_path, "0")
+    agent._tracker.max_tool_tokens = 0
+    assert agent._handoff(False) is False
+    assert agent._handoff(True) is True

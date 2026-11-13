@@ -16,7 +16,9 @@ defaults:
   # Where things live, inside the runner image (see eval/cluster/build/Dockerfile).
   base_manifest: examples/hybrid-inference/cpu-small/inferenceservice.yaml
   isvc: cpu-small
-  praxis_deployment: praxis       # patched only by experiments that set `ask_endpoint`
+  praxis_deployment: praxis       # patched only by experiments with an external model or handoff endpoint
+  gpu_base_manifest: examples/hybrid-inference/gpu-large/inferenceservice.yaml
+  gpu_isvc: gpu-large             # patched only by experiments whose handoff_endpoint is a local model
   namespace: openshift-lightspeed
   eval_repo: /opt/hybrid
   eval_cmd: lightspeed-eval
@@ -65,7 +67,8 @@ defaults:
   # max_model_len, dataset (file name + content), extra_args, extra_env, cpu_limit, judges, thinking, tool_call_parser, reasoning_parser.
   # Runs made before thinking and the parsers were recorded count as thinking: false,
   # tool_call_parser: qwen3_coder, reasoning_parser: qwen3 (what every earlier run used).
-  dedupe_on: [model, cores, max_model_len, dataset, judges, thinking, tool_call_parser, reasoning_parser]
+  dedupe_on: [model, cores, max_model_len, dataset, judges, thinking, tool_call_parser, reasoning_parser,
+              ask_endpoint, handoff_endpoint, handoff_threshold]
 
 # Every model you want to test must be defined here. The runner refuses to start if a model is
 # missing a required value, or if an experiment names a model that is not defined.
@@ -76,6 +79,10 @@ defaults:
 #   gated              (optional) true if the model is gated on Hugging Face (Llama, for example). The
 #                      model pod then gets the token from the `hf-token` secret; see the README. Models
 #                      that are not gated never receive the token.
+#   external           (optional) true for a model hosted outside the cluster (HOSTED_VLLM_API_BASE in the
+#                      eval-credentials secret). It sets only `model`, its id at that endpoint. Nothing is
+#                      patched for it; Praxis is pointed at the endpoint for the run. As an experiment's
+#                      `model` it answers the ask questions; as `handoff_endpoint` it serves the GPU side.
 # Take the parser values from each model's card. Parsers available in your vLLM build
 # include: tool - qwen3_coder, qwen3_xml, hermes, pythonic; reasoning - qwen3, deepseek_r1.
 models:
@@ -114,6 +121,17 @@ models:
     tool_call_parser: gemma4
     reasoning_parser: gemma4
 
+  # Hosted outside the cluster; used with `handoff_endpoint` or as an experiment's `model`.
+  deepseek-external:
+    model: rits/deepseek-ai/DeepSeek-V4.1-Flash-1017
+    external: true
+
+  # A model served locally on the GPU node; used with `handoff_endpoint`.
+  granite4.2-8b-gpu:
+    model: ibm-granite/granite-4.2-8b-fp8
+    tool_call_parser: qwen3_coder
+    reasoning_parser: nemotron_v3
+
 
 # Every judge you want to use is defined here with its provider and model (optional:
 # temperature, max_completion_tokens). The runner refuses to start if one is missing
@@ -137,12 +155,59 @@ judges:
 # the cluster: the runner points Praxis at the endpoint in HOSTED_VLLM_API_BASE, with the key from
 # the eval-credentials secret, and puts Praxis back afterwards. That judge is dropped from the
 # experiment's panel, so the other judges score it and it never scores itself.
+# Handoff: the `model` answers ask questions until the tool calls and their results have used
+# `handoff_threshold` (0 to 1) of the tool token budget, and on the last round after tool calling; then
+# OLS hands the calls to `handoff_endpoint` (a model from `models:`: external, or served on gpu-large).
+# Without `handoff_threshold`, handoff is off. Each change rolls the OLS app server (about a minute),
+# and the runner puts the original setting back at the end. A judge whose model serves answers is
+# removed from that experiment's panel, so the sweep below uses one judge for every row.
 experiments:
   - name: "External - glm-5-3"
     ask_endpoint: glm-5-3
 
   - name: "External - deepseek"
     ask_endpoint: deepseek
+
+  # Threshold sweep: the local CPU model with handoff to deepseek, same 20 questions and judge each time.
+  - name: "Hybrid - no handoff"
+    model: agentworld
+    judges: [glm-5-3]
+    max_conversations: 20
+
+  - name: "Hybrid - handoff at 0 (every call)"
+    model: agentworld
+    handoff_endpoint: deepseek-external
+    handoff_threshold: 0
+    judges: [glm-5-3]
+    max_conversations: 20
+
+  - name: "Hybrid - handoff at 0.3"
+    model: agentworld
+    handoff_endpoint: deepseek-external
+    handoff_threshold: 0.3
+    judges: [glm-5-3]
+    max_conversations: 20
+
+  - name: "Hybrid - handoff at 0.5"
+    model: agentworld
+    handoff_endpoint: deepseek-external
+    handoff_threshold: 0.5
+    judges: [glm-5-3]
+    max_conversations: 20
+
+  - name: "Hybrid - handoff at 0.7"
+    model: agentworld
+    handoff_endpoint: deepseek-external
+    handoff_threshold: 0.7
+    judges: [glm-5-3]
+    max_conversations: 20
+
+  - name: "Hybrid - handoff at 1 (last round only)"
+    model: agentworld
+    handoff_endpoint: deepseek-external
+    handoff_threshold: 1
+    judges: [glm-5-3]
+    max_conversations: 20
 
   # Examples of other things you can vary (uncomment and edit):
   #
