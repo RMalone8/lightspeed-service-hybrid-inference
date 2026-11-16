@@ -141,7 +141,19 @@ def load_run(label: str, path: Path) -> dict[str, Any]:
     perf = [
         {"conversation": k[0], "turn": k[1], **values} for k, values in turns.items()
     ]
+    usage: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for r in rows:
+        key = (r["conversation_group_id"], r["turn_id"])
+        if key not in usage:
+            usage[key] = parse_judge_scores(r.get("round_usage", ""))
+    handoff = meta.get("handoff") or {}
     return {
+        "usage": [
+            {"conversation": k[0], "turn": k[1], "rounds": v} for k, v in usage.items()
+        ],
+        "main_model": meta.get("backend_model") or "main model",
+        "handoff_model": handoff.get("endpoint"),
+        "handoff_threshold": handoff.get("threshold"),
         "label": label,
         "tags": build_tags(configuration, meta),
         "meta": meta,
@@ -390,7 +402,7 @@ const HOME=[
  ["Request latency mean (s)",T("agent_latency","mean"),"s",2],
  ["Output tokens per turn (mean)",T("api_output_tokens","mean"),"tokens",0],
 ];
-const PAGES=[{id:"home",title:"Home"}].concat(TABS.map(t=>({id:t.id,title:t.title}))).concat([{id:"questions",title:"Questions"},{id:"runs",title:"Runs"}]);
+const PAGES=[{id:"home",title:"Home"},{id:"custom",title:"Custom"}].concat(TABS.map(t=>({id:t.id,title:t.title}))).concat([{id:"cost",title:"Cost"},{id:"questions",title:"Questions"},{id:"runs",title:"Runs"}]);
 let page="home",sub=0;
 const nav=document.getElementById("nav");
 nav.innerHTML=PAGES.map(p=>`<button data-id="${p.id}">${p.title}</button>`).join("");
@@ -417,7 +429,7 @@ function baseLayout(title,unit,bottom){
     margin:{l:leftMargin(),r:16,t:44,b:bottom},dragmode:"zoom",bargap:0.4,
     hoverlabel:{bgcolor:"#111",bordercolor:C.red,font:{color:C.fg}},
     xaxis:Object.assign({},axis,{tickmode:"array",tickvals:visible.map((_,n)=>n),ticktext:visible.map(xLabel),
-      tickangle:-40,showgrid:false,zeroline:false,automargin:true,tickfont:{color:C.fg,size:12}}),
+      tickangle:-40,showgrid:false,zeroline:false,automargin:false,tickfont:{color:C.fg,size:12}}),
     shapes:visible.slice(0,-1).map((_,n)=>({type:"line",xref:"x",yref:"paper",x0:n+0.5,x1:n+0.5,y0:-0.05,y1:1,
       line:{color:"#6a6a6a",width:1,dash:"dot"}})),
     yaxis:Object.assign({rangemode:"tozero",title:{text:unit,font:{color:C.mut}}},axis)};
@@ -426,12 +438,24 @@ function labelMargin(){
   const longest=Math.max(1,...visible.map(i=>xLabel(i).replace(/<[^>]+>/g,"").length));
   return Math.min(380,30+Math.round(longest*3.9));
 }
+// The default (auto) range is the furthest out a chart may zoom: pin it as the allowed limits.
+function lockZoomOut(el){
+  const fl=el._fullLayout,upd={};
+  ["xaxis","yaxis"].forEach(a=>{
+    const r=fl&&fl[a]&&fl[a].range;
+    if(r){upd[a+".minallowed"]=Math.min(r[0],r[1]);upd[a+".maxallowed"]=Math.max(r[0],r[1]);}
+  });
+  if(Object.keys(upd).length) Plotly.relayout(el,upd);
+}
+function plotLocked(el,traces,layout){
+  return Plotly.react(el,traces,layout,{responsive:true,displaylogo:false,scrollZoom:true}).then(()=>lockZoomOut(el));
+}
 function finishPlot(divId,traces,layout){
   const el=document.getElementById(divId);
   const height=Math.max(divId==="one"?560:400,320+layout.margin.b);
   el.style.height=height+"px";
   layout.height=height;
-  Plotly.react(el,traces,layout,{responsive:true,displaylogo:false,scrollZoom:true});
+  plotLocked(el,traces,layout);
   if(el.removeAllListeners) el.removeAllListeners("plotly_click");
   el.on("plotly_click",ev=>openRun(visible[ev.points[0].pointIndex]));
 }
@@ -475,6 +499,10 @@ function render(){
     HOME.forEach((h,i)=>plotItem("h"+i,...h));
   } else if(page==="runs"){
     renderRuns(el);
+  } else if(page==="custom"){
+    renderCustom(el);
+  } else if(page==="cost"){
+    renderCost(el);
   } else if(page==="questions"){
     renderQuestions(el);
   } else {
@@ -621,6 +649,215 @@ function openRun(i){
   document.getElementById("dlg").showModal();
 }
 document.getElementById("close").onclick=()=>document.getElementById("dlg").close();
+
+const PRICE_KEYS=[["in","Input"],["cached","Cached input"],["write","Cache write"],["out","Output"]];
+// Built-in list prices ($/M tokens). Anthropic API, 5-minute cache writes at 1.25x input.
+const PRESETS={
+  "Claude Sonnet 5.5":{in:2,cached:0.1,write:2.5,out:10},
+  "Claude Opus 5.5":{in:4,cached:0.2,write:5,out:20},
+  "Claude Fable 5.2":{in:8,cached:0.2,write:10,out:40},
+};
+let prices={};
+try{prices=JSON.parse(localStorage.getItem("ols-prices")||"{}")}catch(e){}
+function priceOf(model){return prices[model]||{}}
+function rate(model,k){const v=parseFloat(priceOf(model)[k]);return isFinite(v)?v:0}
+function sideCost(model,u){
+  const plain=Math.max(0,u.prompt-u.cached-u.write);
+  return (plain*rate(model,"in")+u.cached*rate(model,"cached")+u.write*rate(model,"write")+u.out*rate(model,"out"))/1e6;
+}
+function emptySide(){return {prompt:0,cached:0,write:0,out:0,rounds:0}}
+function addRound(side,r){
+  side.prompt+=r.prompt_tokens||0;side.cached+=r.cached_tokens||0;
+  side.write+=r.cache_write_tokens||0;side.out+=r.completion_tokens||0;side.rounds++;
+}
+function turnUsage(run,t){
+  const main=emptySide(),hand=emptySide();let unreported=0;
+  (t.rounds||[]).forEach(r=>{
+    if(!r.usage_reported){unreported++;return;}
+    addRound(r.handoff?hand:main,r);
+  });
+  return {main,hand,unreported,n:(t.rounds||[]).length};
+}
+function runCost(i){
+  const run=R[i],main=emptySide(),hand=emptySide();let turns=0,missing=0;
+  run.usage.forEach(t=>{
+    if(!t.rounds.length){missing++;return;}
+    const u=turnUsage(run,t);turns++;
+    [["prompt"],["cached"],["write"],["out"],["rounds"]].forEach(([k])=>{main[k]+=u.main[k];hand[k]+=u.hand[k];});
+    if(u.unreported) missing++;
+  });
+  const cm=sideCost(run.main_model,main),ch=run.handoff_model?sideCost(run.handoff_model,hand):0;
+  return {main,hand,turns,missing,cm,ch,total:cm+ch};
+}
+function matchPreset(m){
+  const p=priceOf(m);
+  return Object.keys(PRESETS).find(k=>PRESET_KEYS_EQ(PRESETS[k],p))||"";
+}
+function PRESET_KEYS_EQ(a,b){return PRICE_KEYS.every(([k])=>b[k]!==undefined&&b[k]!==""&&parseFloat(b[k])===a[k]);}
+function questionCosts(i){
+  const run=R[i],out=[];
+  run.usage.forEach(t=>{
+    if(!t.rounds.length) return;
+    const u=turnUsage(run,t);
+    const cost=sideCost(run.main_model,u.main)+(run.handoff_model?sideCost(run.handoff_model,u.hand):0);
+    const tokens=u.main.prompt+u.main.out+u.hand.prompt+u.hand.out;
+    out.push({cost,perM:tokens?cost/tokens*1e6:null});
+  });
+  return out;
+}
+function money(v){return v==null?"n/a":"$"+(v>=1?v.toFixed(2):v.toFixed(4))}
+function renderCost(el){
+  const models=[...new Set(visible.flatMap(i=>[R[i].main_model,R[i].handoff_model]).filter(Boolean))];
+  el.innerHTML=`<div class="desc"><h3>Cost</h3>Enter a price per million tokens for each model. Cost is computed from the
+    provider-reported usage of every LLM round: input = prompt tokens minus cached minus cache writes, so each token is priced once.
+    Pick a preset (Claude Sonnet 5.5, Opus 5.5, Fable 5.2 list prices, cache writes at 1.25x input) to simulate a frontier model for either side. Prices are saved in this browser. Runs without recorded usage show n/a.</div>
+    <div class="panel" style="padding:12px 16px;line-height:1.7">
+      <b>Cost equation</b>, applied separately to the main model and the handoff model, then summed:<br>
+      <code>cost = ( plain &times; P<sub>input</sub> + cached &times; P<sub>cached</sub> + written &times; P<sub>cache write</sub> + completion &times; P<sub>output</sub> ) / 1,000,000</code><br>
+      <code>plain = prompt &minus; cached &minus; written</code> &nbsp; (prompt tokens already include the cached and written ones)<br>
+      Cost per token = cost / (prompt + completion tokens), shown per million tokens. Completion tokens include reasoning tokens.
+    </div>
+    <div class="scroll panel"><table id="prices"></table></div>
+    <div class="chartcard"><div class="plot" id="costplot"></div></div>
+    <div class="chartcard"><div class="plot" id="costtokplot"></div></div>
+    <div class="scroll panel"><table id="costsum"></table></div>
+    <h3 class="sec">Per-question usage <select id="costpick"></select></h3>
+    <div class="scroll panel"><table id="costdetail"></table></div>`;
+  document.getElementById("prices").innerHTML=
+   "<tr><th class='l'>Model</th><th>Preset</th>"+PRICE_KEYS.map(k=>`<th>${k[1]} ($/M tokens)</th>`).join("")+"</tr>"+
+   models.map((m,n)=>`<tr><td class="l">${esc(m)}</td><td><select data-preset="${n}"><option value="">(custom)</option>${Object.keys(PRESETS).map(k=>`<option ${matchPreset(m)===k?"selected":""}>${k}</option>`).join("")}</select></td>`+PRICE_KEYS.map(([k])=>
+     `<td><input type="number" min="0" step="any" data-m="${n}" data-k="${k}" value="${esc(priceOf(m)[k]??"")}" style="width:90px"></td>`).join("")+"</tr>").join("");
+  document.getElementById("prices").onchange=e=>{
+    if(e.target.dataset.preset==null) return;
+    const m=models[+e.target.dataset.preset],pr=PRESETS[e.target.value];
+    if(pr) prices[m]=Object.assign({},pr); else return;
+    try{localStorage.setItem("ols-prices",JSON.stringify(prices))}catch(x){}
+    renderCost(document.getElementById("page"));
+  };
+  document.getElementById("prices").oninput=e=>{
+    const m=models[+e.target.dataset.m],k=e.target.dataset.k;if(m==null)return;
+    prices[m]=Object.assign({},prices[m],{[k]:e.target.value});
+    try{localStorage.setItem("ols-prices",JSON.stringify(prices))}catch(x){}
+    drawCostTables();
+  };
+  const pick=document.getElementById("costpick");
+  pick.innerHTML=visible.map(i=>`<option value="${i}">${esc(nm(i))} - ${esc(S[i].label)}</option>`).join("");
+  pick.onchange=()=>drawCostDetail(pick.value);
+  drawCostTables();
+}
+function drawCostTables(){
+  const rows=visible.map(i=>({i,c:runCost(i)}));
+  const tot=(k)=>rows.map(r=>r.c.turns?r.c[k]/r.c.turns:null);
+  const x=rows.map((_,n)=>n);
+  const bar=(name,k,color)=>({type:"bar",name,x,y:tot(k),marker:{color},
+    hovertemplate:name+": $%{y:.5f} per question<extra></extra>"});
+  const lay=baseLayout("Mean cost per question ($)","$ per question",labelMargin());
+  lay.barmode="stack";lay.showlegend=true;lay.legend={font:{color:C.fg},orientation:"h",y:1.08};
+  finishPlot("costplot",[bar("Main model","cm","#a8d8ea"),bar("Handoff model","ch","#ffd6a5")],lay);
+  const tk=rows.map(r=>{const q=questionCosts(r.i).map(x=>x.perM).filter(v=>v!=null);
+    return q.length?q.reduce((a,b)=>a+b,0)/q.length:null;});
+  const lay2=baseLayout("Mean cost per token ($ per million tokens, input + output)","$ per M tokens",labelMargin());
+  finishPlot("costtokplot",[{type:"bar",x,y:tk,
+    marker:{color:rows.map(r=>PASTELS[r.i%PASTELS.length])},
+    hovertemplate:"$%{y:.3f} per M tokens<extra></extra>"}],lay2);
+  document.getElementById("costsum").innerHTML=
+   "<tr><th class='l'>Run</th><th>Questions</th><th>Rounds main / handoff</th><th>Main in (cached)</th><th>Main out</th>"+
+   "<th>Handoff in (cached)</th><th>Handoff out</th><th>Cost main</th><th>Cost handoff</th><th>Total</th><th>Per question</th></tr>"+
+   rows.map(({i,c})=>{
+    if(!c.turns) return `<tr><td class="l"><a href="#" onclick="openRun(${i});return false">${esc(nm(i))}</a></td><td colspan="10" style="color:var(--muted)">no usage recorded</td></tr>`;
+    return `<tr><td class="l"><a href="#" onclick="openRun(${i});return false">${esc(nm(i))}</a></td><td>${c.turns}${c.missing?` (+${c.missing} partial)`:""}</td>
+     <td>${c.main.rounds} / ${c.hand.rounds}</td>
+     <td>${fmt(c.main.prompt,0)} (${fmt(c.main.cached,0)})</td><td>${fmt(c.main.out,0)}</td>
+     <td>${fmt(c.hand.prompt,0)} (${fmt(c.hand.cached,0)})</td><td>${fmt(c.hand.out,0)}</td>
+     <td>${money(c.cm)}</td><td>${money(c.ch)}</td><td><b>${money(c.total)}</b></td><td>${money(c.total/c.turns)}</td></tr>`}).join("");
+  const pick=document.getElementById("costpick");
+  if(pick) drawCostDetail(pick.value);
+}
+function drawCostDetail(i){
+  const run=R[i],box=document.getElementById("costdetail");if(!run||!box)return;
+  const q={};run.scored.forEach(r=>{q[r.conversation+"|"+r.turn]=r.query});
+  box.innerHTML="<tr><th>Conv / turn</th><th>Rounds main / handoff</th><th>Main in (cached)</th><th>Main out</th>"+
+   "<th>Handoff in (cached)</th><th>Handoff out</th><th>Cost</th><th class='l'>Query</th></tr>"+
+   run.usage.map((t,n)=>{
+    if(!t.rounds.length) return "";
+    const u=turnUsage(run,t);
+    const c=sideCost(run.main_model,u.main)+(run.handoff_model?sideCost(run.handoff_model,u.hand):0);
+    return `<tr><td>${esc(t.conversation)} / ${esc(t.turn)}</td><td>${u.main.rounds} / ${u.hand.rounds}${u.unreported?` (${u.unreported} unreported)`:""}</td>
+     <td>${fmt(u.main.prompt,0)} (${fmt(u.main.cached,0)})</td><td>${fmt(u.main.out,0)}</td>
+     <td>${fmt(u.hand.prompt,0)} (${fmt(u.hand.cached,0)})</td><td>${fmt(u.hand.out,0)}</td>
+     <td>${money(c)}</td><td class="l"><a href="#" onclick="openRounds(${i},${n});return false">${esc((q[t.conversation+"|"+t.turn]||"").slice(0,90))}</a></td></tr>`}).join("");
+}
+function openRounds(i,n){
+  const run=R[i],t=run.usage[n];
+  document.getElementById("dlgbody").innerHTML=
+   `<h2>${esc(t.conversation)} / ${esc(t.turn)}</h2><div style="color:var(--muted)">${esc(nm(i))}</div>
+    <h3>Rounds</h3><div class="scroll"><table><tr><th>Round</th><th class="l">Side</th><th>Prompt</th><th>Cached</th><th>Cache write</th><th>Output</th><th>Reasoning</th></tr>`+
+   t.rounds.map(r=>`<tr><td>${r.round}</td><td class="l">${r.handoff?"handoff":"main"}</td><td>${fmt(r.prompt_tokens,0)}</td><td>${fmt(r.cached_tokens,0)}</td>
+    <td>${fmt(r.cache_write_tokens,0)}</td><td>${fmt(r.completion_tokens,0)}</td><td>${fmt(r.reasoning_tokens,0)}</td></tr>`).join("")+"</table></div>";
+  document.getElementById("dlg").showModal();
+}
+
+function customMetrics(){
+  const m=[];
+  TABS.forEach(t=>t.subs.forEach(([name,get,unit,d])=>m.push({name:t.title+": "+name,unit,d,get:i=>get(S[i])})));
+  const avg=(i,f)=>{const q=questionCosts(i);return q.length?f(q)/q.length:null;};
+  const side=(i,side,k)=>{const c=runCost(i);return c.turns?c[side][k]/c.turns:null;};
+  m.push(
+   {name:"Cost: total per question",unit:"$",d:4,get:i=>{const c=runCost(i);return c.turns?c.total/c.turns:null}},
+   {name:"Cost: main model per question",unit:"$",d:4,get:i=>{const c=runCost(i);return c.turns?c.cm/c.turns:null}},
+   {name:"Cost: handoff model per question",unit:"$",d:4,get:i=>{const c=runCost(i);return c.turns?c.ch/c.turns:null}},
+   {name:"Cost: total for the run",unit:"$",d:2,get:i=>{const c=runCost(i);return c.turns?c.total:null}},
+   {name:"Cost: per million tokens (mean over questions)",unit:"$ / M tokens",d:3,get:i=>avg(i,q=>q.reduce((a,x)=>a+(x.perM||0),0))},
+   {name:"Usage: main input tokens per question",unit:"tokens",d:0,get:i=>side(i,"main","prompt")},
+   {name:"Usage: main output tokens per question",unit:"tokens",d:0,get:i=>side(i,"main","out")},
+   {name:"Usage: handoff input tokens per question",unit:"tokens",d:0,get:i=>side(i,"hand","prompt")},
+   {name:"Usage: handoff output tokens per question",unit:"tokens",d:0,get:i=>side(i,"hand","out")},
+   {name:"Usage: main rounds per question",unit:"rounds",d:2,get:i=>side(i,"main","rounds")},
+   {name:"Usage: handoff rounds per question",unit:"rounds",d:2,get:i=>side(i,"hand","rounds")},
+   {name:"Handoff threshold",unit:"fraction",d:2,get:i=>R[i].handoff_threshold==null?null:R[i].handoff_threshold}
+  );
+  return m;
+}
+let customX=null,customY=null;
+function renderCustom(el){
+  const M=customMetrics();
+  const find=n=>M.findIndex(x=>x.name===n);
+  let xi=customX==null?-1:find(customX),yi=customY==null?-1:find(customY);
+  if(xi<0) xi=Math.max(0,find("Cost: total per question"));
+  if(yi<0) yi=Math.max(0,find("Quality: Pass rate (%)"));
+  const opts=sel=>M.map((x,n)=>`<option value="${n}" ${n===sel?"selected":""}>${esc(x.name)}</option>`).join("");
+  el.innerHTML=`<div class="desc"><h3>Custom</h3>Pick any two measures to compare runs against each other. Each dot is one run, labelled with its name.
+    Runs with no value for a measure (for example cost on runs without recorded usage) are left out.</div>
+    <div class="subtabs"><label>X axis <select id="cx">${opts(xi)}</select></label>
+    <label style="margin-left:16px">Y axis <select id="cy">${opts(yi)}</select></label></div>
+    <div class="chartcard"><div class="plot big" id="cplot"></div></div>
+    <div class="hint">Drag to zoom, double-click to reset, click a dot for every parameter of that run.</div>`;
+  const draw=()=>{
+    const X=M[+document.getElementById("cx").value],Y=M[+document.getElementById("cy").value];
+    customX=X.name;customY=Y.name;
+    const pts=visible.map(i=>({i,x:X.get(i),y:Y.get(i)})).filter(p=>p.x!=null&&p.y!=null);
+    const axis=t=>({title:{text:t,font:{color:C.mut}},gridcolor:C.grid,zerolinecolor:C.grid,linecolor:C.grid,tickfont:{color:C.mut},automargin:false});
+    const lay={paper_bgcolor:"rgba(0,0,0,0)",plot_bgcolor:"rgba(0,0,0,0)",
+      font:{family:"Red Hat Text, system-ui, sans-serif",size:11,color:C.fg},
+      title:{text:(pts.length?"":"No runs have both values. ")+Y.name+" vs "+X.name,font:{size:13},x:0.02,xanchor:"left"},
+      margin:{l:90,r:30,t:50,b:80},dragmode:"zoom",showlegend:false,
+      hoverlabel:{bgcolor:"#111",bordercolor:C.red,font:{color:C.fg}},
+      xaxis:axis(X.name+(X.unit?" ("+X.unit+")":"")),yaxis:axis(Y.name+(Y.unit?" ("+Y.unit+")":""))};
+    const tr={type:"scatter",mode:"markers+text",x:pts.map(p=>p.x),y:pts.map(p=>p.y),
+      text:pts.map(p=>xLabel(p.i)),textposition:"top center",textfont:{color:C.fg,size:11},cliponaxis:false,
+      marker:{size:13,color:pts.map(p=>PASTELS[p.i%PASTELS.length]),line:{color:C.fg,width:1}},
+      customdata:pts.map(p=>[S[p.i].label]),
+      hovertemplate:"<b>%{text}</b><br>"+X.name+": %{x}<br>"+Y.name+": %{y}<br>%{customdata[0]}<extra></extra>"};
+    const div=document.getElementById("cplot");
+    div.style.height="560px";lay.height=560;
+    plotLocked(div,[tr],lay);
+    if(div.removeAllListeners) div.removeAllListeners("plotly_click");
+    div.on("plotly_click",ev=>openRun(pts[ev.points[0].pointIndex].i));
+  };
+  document.getElementById("cx").onchange=draw;
+  document.getElementById("cy").onchange=draw;
+  draw();
+}
 
 function refresh(){applyFilter();render();}
 refresh();

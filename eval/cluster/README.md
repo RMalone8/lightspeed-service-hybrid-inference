@@ -212,6 +212,15 @@ resources, thinking, parsers, judges, vLLM version, throttling counters); `rende
 metric at a time, with filters on run settings and a judge view (recorded, average, max, majority, or
 each judge).
 
+## Cost
+
+The dashboard's **Cost** page prices each run from the provider-reported usage recorded per LLM round
+(`round_usage` in the CSV). Enter $ per million tokens for input, cached input, cache write and output
+for each main and handoff model (saved in the browser). Input is prompt tokens minus cached minus cache
+writes, so nothing is priced twice. You get cost per run and per question, split between the main model
+and the handoff model, with input and output tokens for each side and a per-round view of any question.
+Runs from before usage was recorded show "no usage recorded".
+
 ## Notes
 
 - **Every experiment restarts the model pod** (about 10 minutes for a 35B model, plus its first
